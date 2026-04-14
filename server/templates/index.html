@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DocFinder</title>
+  <style>
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface-2: #21262d;
+      --border:    #30363d;
+      --accent:    #58a6ff;
+      --accent-2:  #79c0ff;
+      --text:      #c9d1d9;
+      --muted:     #8b949e;
+      --green:     #3fb950;
+      --red:       #f85149;
+      --r:         8px;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      min-height: 100vh;
+      padding: 2.5rem 1rem 4rem;
+    }
+
+    .wrap {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+
+    /* En-tête */
+    .header {
+      margin-bottom: 2.5rem;
+      text-align: center;
+    }
+    .header h1 {
+      font-size: clamp(1.75rem, 4vw, 2.5rem);
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: #fff;
+      margin-bottom: 0.4rem;
+    }
+    .header h1 span { color: var(--accent); }
+    .header p {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    /* Formulaire */
+    .search-form {
+      display: flex;
+      gap: 0.6rem;
+      margin-bottom: 2rem;
+    }
+    .search-input {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      color: var(--text);
+      font-size: 1rem;
+      outline: none;
+      transition: border-color 150ms;
+    }
+    .search-input:focus { border-color: var(--accent); }
+    .search-input::placeholder { color: var(--muted); }
+
+    .btn {
+      padding: 0.75rem 1.5rem;
+      background: var(--accent);
+      color: #0d1117;
+      font-size: 0.9rem;
+      font-weight: 600;
+      border: none;
+      border-radius: var(--r);
+      cursor: pointer;
+      transition: background 150ms, transform 80ms;
+      white-space: nowrap;
+    }
+    .btn:hover { background: var(--accent-2); }
+    .btn:active { transform: scale(0.97); }
+
+    /* Erreur */
+    .error {
+      padding: 0.85rem 1rem;
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px solid rgba(248, 81, 73, 0.35);
+      border-radius: var(--r);
+      color: var(--red);
+      font-size: 0.875rem;
+      margin-bottom: 1.5rem;
+    }
+
+    /* En-tête résultats */
+    .results-meta {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 1rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .results-meta strong { color: var(--text); }
+
+    /* Carte résultat */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 1.1rem 1.25rem;
+      margin-bottom: 0.85rem;
+      transition: border-color 150ms;
+    }
+    .card:hover { border-color: var(--accent); }
+
+    .card-title {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--accent-2);
+      margin-bottom: 0.3rem;
+    }
+    .card-path {
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 0.7rem;
+      word-break: break-all;
+    }
+    .card-excerpt {
+      font-size: 0.875rem;
+      color: var(--text);
+      line-height: 1.65;
+      margin-bottom: 0.85rem;
+    }
+    .card-footer {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      line-height: 1.4;
+    }
+    .badge-type {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .badge-score {
+      background: rgba(88, 166, 255, 0.12);
+      border: 1px solid rgba(88, 166, 255, 0.3);
+      color: var(--accent);
+    }
+    .badge-kw {
+      background: rgba(63, 185, 80, 0.1);
+      border: 1px solid rgba(63, 185, 80, 0.25);
+      color: var(--green);
+    }
+
+    /* Aucun résultat */
+    .empty {
+      text-align: center;
+      padding: 3.5rem 0;
+      color: var(--muted);
+    }
+    .empty strong { color: var(--text); }
+
+    @media (max-width: 520px) {
+      .search-form { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <header class="header">
+      <h1>Doc<span>Finder</span></h1>
+      <p>Recherche hybride dans vos documents personnels</p>
+    </header>
+
+    <form class="search-form" method="post" action="/search">
+      <input
+        class="search-input"
+        type="text"
+        name="query"
+        value="{{ query }}"
+        placeholder="Recherche en langage naturel…"
+        autofocus
+        autocomplete="off"
+        spellcheck="false"
+      >
+      <input type="hidden" name="limit" value="10">
+      <button class="btn" type="submit">Rechercher</button>
+    </form>
+
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    {% if results is not none %}
+      {% if results %}
+        <p class="results-meta">
+          <strong>{{ results | length }}</strong>
+          résultat{{ 's' if results | length > 1 else '' }}
+          pour <strong>« {{ query }} »</strong>
+        </p>
+
+        {% for r in results %}
+        <article class="card">
+          <div class="card-title">{{ r.title }}</div>
+          <div class="card-path">{{ r.path }}</div>
+          <p class="card-excerpt">{{ r.excerpt }}</p>
+          <div class="card-footer">
+            <span class="badge badge-type">{{ r.doc_type | upper }}</span>
+            <span class="badge badge-score">score {{ "%.4f"|format(r.score) }}</span>
+            {% for kw in r.keywords[:5] %}
+            <span class="badge badge-kw">{{ kw }}</span>
+            {% endfor %}
+          </div>
+        </article>
+        {% endfor %}
+
+      {% else %}
+        <div class="empty">
+          Aucun résultat pour <strong>« {{ query }} »</strong>
+        </div>
+      {% endif %}
+    {% endif %}
+
+  </div>
+</body>
+</html>
