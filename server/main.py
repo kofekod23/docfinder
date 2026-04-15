@@ -380,6 +380,46 @@ async def admin_tunnels() -> JSONResponse:
         return JSONResponse({})
 
 
+@app.get("/admin/resources")
+async def admin_resources() -> JSONResponse:
+    """
+    Retourne l'utilisation CPU et RAM des processus DocFinder (uvicorn + qdrant).
+    Utilise cpu_percent(interval=None) pour ne pas bloquer.
+    """
+    import os
+
+    import psutil
+
+    pid = os.getpid()
+
+    def _gather() -> dict:
+        uvicorn_cpu = uvicorn_rss = qdrant_cpu = qdrant_rss = 0.0
+        try:
+            p = psutil.Process(pid)
+            uvicorn_cpu = p.cpu_percent(interval=None)
+            uvicorn_rss = p.memory_info().rss / 1_048_576
+        except Exception:
+            pass
+        try:
+            for p in psutil.process_iter(["pid", "name", "cmdline"]):
+                name = (p.info.get("name") or "").lower()
+                cmd = " ".join(p.info.get("cmdline") or []).lower()
+                if "qdrant" in name or "qdrant" in cmd:
+                    qdrant_cpu = p.cpu_percent(interval=None)
+                    qdrant_rss = p.memory_info().rss / 1_048_576
+                    break
+        except Exception:
+            pass
+        return {
+            "uvicorn": {"cpu": round(uvicorn_cpu, 1), "rss_mb": round(uvicorn_rss, 1)},
+            "qdrant":  {"cpu": round(qdrant_cpu, 1),  "rss_mb": round(qdrant_rss, 1)},
+        }
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _gather)
+    return JSONResponse(data)
+
+
 @app.get("/health")
 async def health() -> dict:
     """Endpoint de santé — vérifie que le moteur est initialisé."""

@@ -173,6 +173,57 @@
     }
     .log-box p { margin: 0; }
 
+    /* Kill button */
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+    }
+    .card-header h2 { margin-bottom: 0; }
+    .btn-kill {
+      padding: .3rem .75rem;
+      background: rgba(248,81,73,.12);
+      border: 1px solid rgba(248,81,73,.4);
+      border-radius: 6px;
+      color: var(--red);
+      font-size: .75rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 150ms;
+    }
+    .btn-kill:hover { background: rgba(248,81,73,.25); }
+    .btn-kill:disabled { opacity: .4; cursor: not-allowed; }
+
+    /* Resource bars */
+    .res-row {
+      display: grid;
+      grid-template-columns: 110px 1fr 52px;
+      align-items: center;
+      gap: .6rem;
+      margin-bottom: .6rem;
+    }
+    .res-label { font-size: .78rem; color: var(--muted); }
+    .res-bar-wrap {
+      height: 7px;
+      background: var(--surface-2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .res-bar {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 600ms ease;
+      min-width: 0;
+    }
+    .res-bar-cpu { background: var(--accent); }
+    .res-bar-ram { background: var(--green); }
+    .res-bar-warn { background: var(--yellow); }
+    .res-bar-crit { background: var(--red); }
+    .res-val { font-size: .75rem; color: var(--text); text-align: right; font-family: ui-monospace,"SF Mono",monospace; }
+    .res-section { font-size: .7rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: .9rem 0 .5rem; }
+    .res-section:first-child { margin-top: 0; }
+
     /* Colab status */
     .colab-status {
       display: flex;
@@ -225,7 +276,6 @@
           </span>
         </div>
         <button class="btn" type="submit" id="startBtn">Lancer l'indexation</button>
-        <button class="btn" type="button" id="cancelBtn" style="background:var(--red);display:none;margin-left:.75rem" onclick="cancelJob()">Annuler</button>
       </form>
     </div>
 
@@ -263,7 +313,10 @@
     </div>
 
     <div class="card" id="statusCard">
-      <h2>Progression</h2>
+      <div class="card-header">
+        <h2>Progression</h2>
+        <button class="btn-kill" id="killBtn" onclick="killJob()" title="Forcer l'arrêt du job en cours">⏹ Forcer l'arrêt</button>
+      </div>
 
       <div class="status-bar status-{{ job.status }}" id="statusBar">
         <div class="dot dot-{{ job.status }}" id="dot"></div>
@@ -289,12 +342,40 @@
       </div>
     </div>
 
+    <div class="card" id="resourcesCard">
+      <h2>Ressources</h2>
+
+      <p class="res-section">Serveur</p>
+      <div class="res-row">
+        <span class="res-label">CPU</span>
+        <div class="res-bar-wrap"><div class="res-bar res-bar-cpu" id="uCpuBar" style="width:0%"></div></div>
+        <span class="res-val" id="uCpuVal">—</span>
+      </div>
+      <div class="res-row">
+        <span class="res-label">RAM</span>
+        <div class="res-bar-wrap"><div class="res-bar res-bar-ram" id="uRamBar" style="width:0%"></div></div>
+        <span class="res-val" id="uRamVal">—</span>
+      </div>
+
+      <p class="res-section">Qdrant</p>
+      <div class="res-row">
+        <span class="res-label">CPU</span>
+        <div class="res-bar-wrap"><div class="res-bar res-bar-cpu" id="qCpuBar" style="width:0%"></div></div>
+        <span class="res-val" id="qCpuVal">—</span>
+      </div>
+      <div class="res-row">
+        <span class="res-label">RAM</span>
+        <div class="res-bar-wrap"><div class="res-bar res-bar-ram" id="qRamBar" style="width:0%"></div></div>
+        <span class="res-val" id="qRamVal">—</span>
+      </div>
+    </div>
+
   </div>
 
   <script>
     const form      = document.getElementById('indexForm');
     const startBtn  = document.getElementById('startBtn');
-    const cancelBtn = document.getElementById('cancelBtn');
+    const killBtn   = document.getElementById('killBtn');
     const statusBar = document.getElementById('statusBar');
     const dot       = document.getElementById('dot');
     const statusTxt = document.getElementById('statusText');
@@ -334,7 +415,7 @@
 
       // Boutons
       startBtn.disabled = (s === 'running');
-      cancelBtn.style.display = (s === 'running') ? 'inline-block' : 'none';
+      killBtn.disabled  = (s !== 'running');
 
       // Arrêt du polling
       if ((s === 'done' || s === 'error') && pollInterval) {
@@ -403,11 +484,70 @@
       }
     }
 
-    async function cancelJob() {
-      cancelBtn.disabled = true;
-      await fetch('/admin/cancel', { method: 'POST' });
-      cancelBtn.disabled = false;
+    async function killJob() {
+      killBtn.disabled = true;
+      killBtn.textContent = '⏹ Arrêt…';
+      try {
+        await fetch('/admin/cancel', { method: 'POST' });
+        await poll();
+      } finally {
+        killBtn.textContent = '⏹ Forcer l\'arrêt';
+        killBtn.disabled = false;
+      }
     }
+
+    // ── Ressources ─────────────────────────────────────────────────────────
+    const RAM_MAX_MB = 1500;
+
+    function cpuColor(pct) {
+      if (pct >= 80) return 'res-bar-crit';
+      if (pct >= 50) return 'res-bar-warn';
+      return 'res-bar-cpu';
+    }
+
+    function ramColor(pct) {
+      if (pct >= 80) return 'res-bar-crit';
+      if (pct >= 55) return 'res-bar-warn';
+      return 'res-bar-ram';
+    }
+
+    function setBar(barEl, valEl, pct, label) {
+      barEl.style.width = Math.min(pct, 100) + '%';
+      valEl.textContent = label;
+    }
+
+    async function refreshResources() {
+      try {
+        const r = await fetch('/admin/resources');
+        const d = await r.json();
+
+        const uCpu = d.uvicorn.cpu, uRam = d.uvicorn.rss_mb;
+        const qCpu = d.qdrant.cpu,  qRam = d.qdrant.rss_mb;
+
+        const uCpuBar = document.getElementById('uCpuBar');
+        uCpuBar.className = 'res-bar ' + cpuColor(uCpu);
+        setBar(uCpuBar, document.getElementById('uCpuVal'), uCpu, uCpu + '%');
+
+        const uRamPct = (uRam / RAM_MAX_MB) * 100;
+        const uRamBar = document.getElementById('uRamBar');
+        uRamBar.className = 'res-bar ' + ramColor(uRamPct);
+        setBar(uRamBar, document.getElementById('uRamVal'), uRamPct, Math.round(uRam) + ' MB');
+
+        const qCpuBar = document.getElementById('qCpuBar');
+        qCpuBar.className = 'res-bar ' + cpuColor(qCpu);
+        setBar(qCpuBar, document.getElementById('qCpuVal'), qCpu, qCpu + '%');
+
+        const qRamPct = (qRam / RAM_MAX_MB) * 100;
+        const qRamBar = document.getElementById('qRamBar');
+        qRamBar.className = 'res-bar ' + ramColor(qRamPct);
+        setBar(qRamBar, document.getElementById('qRamVal'),
+               qRamPct, qRam > 0 ? Math.round(qRam) + ' MB' : '—');
+
+      } catch(e) { /* réseau */ }
+    }
+
+    setInterval(refreshResources, 3000);
+    refreshResources();
 
     // ── Colab status ────────────────────────────────────────────────────────
     const colabDot    = document.getElementById('colabDot');
