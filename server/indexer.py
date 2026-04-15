@@ -96,8 +96,40 @@ def current_job() -> dict:
         return _job.to_dict()
 
 
+def _upsert_with_retry(
+    client: QdrantClient,
+    points: list[PointStruct],
+    max_retries: int = 3,
+) -> None:
+    """Upsert un batch dans Qdrant avec retry exponentiel (1s → 2s → 4s).
+
+    Qdrant peut échouer ponctuellement sur un batch (overload, GC pause).
+    3 tentatives couvrent les transitoires sans masquer les pannes durables.
+    """
+    import time as _time
+
+    delay = 1.0
+    for attempt in range(1, max_retries + 2):
+        try:
+            client.upsert(collection_name=COLLECTION, points=points, wait=False)
+            return
+        except Exception as e:
+            if attempt > max_retries:
+                raise
+            log.warning(
+                "upsert Qdrant échoué (tentative %d/%d) : %s — retry dans %.0fs",
+                attempt, max_retries, e, delay,
+            )
+            _time.sleep(delay)
+            delay *= 2
+
+
 def upsert_points(points_data: list[dict]) -> int:
-    """Insère des points (envoyés par Colab) dans Qdrant local."""
+    """Insère des points (envoyés par Colab) dans Qdrant local.
+
+    Chaque batch est envoyé via _upsert_with_retry pour absorber les
+    transitoires Qdrant (GC pause, surcharge momentanée).
+    """
     client = QdrantClient(url=QDRANT_URL)
     structs: list[PointStruct] = []
     for p in points_data:
@@ -113,7 +145,7 @@ def upsert_points(points_data: list[dict]) -> int:
             payload=p["payload"],
         ))
     for i in range(0, len(structs), BATCH_SIZE):
-        client.upsert(collection_name=COLLECTION, points=structs[i : i + BATCH_SIZE], wait=False)
+        _upsert_with_retry(client, structs[i : i + BATCH_SIZE])
     return len(structs)
 
 
@@ -329,7 +361,7 @@ def _run(path: str, reset: bool) -> None:
                 ))
 
             for i in range(0, len(points), BATCH_SIZE):
-                client.upsert(collection_name=COLLECTION, points=points[i: i + BATCH_SIZE])
+                _upsert_with_retry(client, points[i: i + BATCH_SIZE])
 
             with _lock:
                 _job.chunks += len(points)

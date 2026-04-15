@@ -1,18 +1,100 @@
-#!/bin/bash
-# Démarre Qdrant + le serveur DocFinder
-# Usage : ./start.sh (depuis /Users/julien/docfinder)
+#!/usr/bin/env bash
+# start.sh — Démarre DocFinder en une seule commande.
+#
+# Ce que ce script fait :
+#   1. Télécharge le binaire Qdrant si absent (détection d'OS automatique)
+#   2. Lance Qdrant en arrière-plan et attend qu'il soit prêt (max 15s)
+#   3. Crée la collection Qdrant si elle n'existe pas (setup_qdrant.py)
+#   4. Lance le serveur FastAPI sur le port 8000 (uvicorn, reload activé)
+#
+# Usage :
+#   bash start.sh          # démarrage normal
+#   bash start.sh --reset  # réinitialise la collection avant de démarrer
 
-set -e
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
-./qdrant &
-QDRANT_PID=$!
-echo "[DocFinder] Qdrant démarré (PID $QDRANT_PID)"
+# ── Constantes ────────────────────────────────────────────────────────────────
+QDRANT_VERSION="v1.13.4"
+QDRANT_PORT=6333
+STARTUP_TIMEOUT=15   # secondes max pour attendre que Qdrant démarre
+COLLECTION="docfinder"
 
-source .venv/bin/activate
-echo "[DocFinder] Serveur disponible sur http://localhost:8000"
-uvicorn server.main:app --port 8000
+# ── Détection OS / architecture ───────────────────────────────────────────────
+OS="$(uname -s)"
+ARCH="$(uname -m)"
 
-kill $QDRANT_PID 2>/dev/null
-echo "[DocFinder] Arrêt."
+case "${OS}-${ARCH}" in
+    Darwin-arm64)  QDRANT_TARBALL="qdrant-aarch64-apple-darwin.tar.gz" ;;
+    Darwin-x86_64) QDRANT_TARBALL="qdrant-x86_64-apple-darwin.tar.gz"  ;;
+    Linux-x86_64)  QDRANT_TARBALL="qdrant-x86_64-unknown-linux-musl.tar.gz" ;;
+    *)
+        echo "⛔  Architecture non supportée : ${OS}-${ARCH}"
+        echo "   Téléchargez manuellement : https://github.com/qdrant/qdrant/releases"
+        exit 1
+        ;;
+esac
+
+# ── 1. Téléchargement de Qdrant si absent ─────────────────────────────────────
+if [[ ! -x "./qdrant" ]]; then
+    echo "→ Binaire Qdrant absent — téléchargement ${QDRANT_VERSION} (${QDRANT_TARBALL})…"
+    QDRANT_URL="https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/${QDRANT_TARBALL}"
+    curl -fsSL "${QDRANT_URL}" | tar -xz
+    chmod +x qdrant
+    echo "   Qdrant téléchargé ✓"
+fi
+
+# ── 2. Démarrage de Qdrant en arrière-plan ────────────────────────────────────
+echo "→ Démarrage de Qdrant (port ${QDRANT_PORT})…"
+
+if lsof -ti "tcp:${QDRANT_PORT}" &>/dev/null; then
+    echo "   Port ${QDRANT_PORT} déjà occupé — Qdrant déjà en cours d'exécution."
+else
+    ./qdrant --config-path qdrant_config.yaml &>/dev/null &
+    echo "   PID Qdrant : $!"
+fi
+
+# Attendre que Qdrant réponde sur /healthz
+echo -n "   Attente que Qdrant soit prêt"
+elapsed=0
+until curl -sf "http://localhost:${QDRANT_PORT}/healthz" &>/dev/null; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    echo -n "."
+    if [[ ${elapsed} -ge ${STARTUP_TIMEOUT} ]]; then
+        echo ""
+        echo "⛔  Qdrant n'a pas démarré dans les ${STARTUP_TIMEOUT}s."
+        echo "   Lancez manuellement pour voir les logs :"
+        echo "     ./qdrant --config-path qdrant_config.yaml"
+        exit 1
+    fi
+done
+echo " ✓"
+
+# ── 3. Initialisation de la collection si absente ─────────────────────────────
+RESET_FLAG="${1:-}"
+if [[ "${RESET_FLAG}" == "--reset" ]]; then
+    echo "→ Réinitialisation de la collection (--reset)…"
+    python setup_qdrant.py --force
+    echo "   Collection réinitialisée ✓"
+else
+    HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+        "http://localhost:${QDRANT_PORT}/collections/${COLLECTION}" 2>/dev/null || echo "000")
+    if [[ "${HTTP_STATUS}" != "200" ]]; then
+        echo "→ Collection '${COLLECTION}' absente — initialisation…"
+        python setup_qdrant.py
+        echo "   Collection créée ✓"
+    else
+        echo "→ Collection '${COLLECTION}' déjà présente ✓"
+    fi
+fi
+
+# ── 4. Démarrage du serveur FastAPI ───────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  DocFinder prêt — http://localhost:8000"
+echo "  Admin         — http://localhost:8000/admin"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+exec uvicorn server.main:app --port 8000 --reload
