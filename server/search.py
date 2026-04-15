@@ -226,6 +226,7 @@ class SearchEngine:
                     doc_id=payload.get("doc_id", ""),
                     title=payload.get("title", "Sans titre"),
                     path=payload.get("path", ""),
+                    abs_path=payload.get("abs_path", ""),
                     doc_type=payload.get("doc_type", ""),
                     score=round(rrf_score, 4),
                     excerpt=excerpt,

@@ -307,8 +307,8 @@
             {% endfor %}
           </div>
           <div class="card-actions">
-            <button class="action-btn" onclick="openDoc('{{ r.path | e }}')">↗ Ouvrir</button>
-            <button class="action-btn" onclick="previewDoc('{{ r.path | e }}', '{{ r.title | e }}')">⊡ Aperçu</button>
+            <button class="action-btn" onclick="openDoc('{{ (r.abs_path if r.abs_path else r.path) | e }}')">↗ Ouvrir</button>
+            <button class="action-btn" onclick="previewDoc('{{ (r.abs_path if r.abs_path else r.path) | e }}', '{{ r.title | e }}')">⊡ Aperçu</button>
           </div>
         </article>
         {% endfor %}

@@ -43,6 +43,7 @@ class SearchResult(BaseModel):
     doc_id: str
     title: str
     path: str
+    abs_path: str = ""  # chemin absolu (vide pour les anciens chunks sans ce champ)
     doc_type: str
     score: float       # score RRF fusionné (dense + sparse)
     excerpt: str       # 300 premiers caractères du chunk pour l'affichage

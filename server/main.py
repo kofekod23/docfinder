@@ -235,14 +235,23 @@ async def admin_upsert(request: Request) -> JSONResponse:
 async def doc_open(path: str = Query(...)) -> JSONResponse:
     """
     Ouvre un document avec l'application macOS par défaut.
-    `path` est le chemin relatif stocké dans Qdrant (relatif à ICLOUD_DEFAULT).
+    `path` peut être absolu (nouveau) ou relatif à ICLOUD_DEFAULT (rétrocompat).
     """
-    root = Path(ICLOUD_DEFAULT).resolve()
-    abs_path = (root / unquote(path)).resolve()
-    try:
-        abs_path.relative_to(root)
-    except ValueError:
-        return JSONResponse({"error": "Accès refusé."}, status_code=403)
+    decoded = unquote(path)
+    p = Path(decoded)
+    if p.is_absolute():
+        abs_path = p.resolve()
+        try:
+            abs_path.relative_to(Path.home())
+        except ValueError:
+            return JSONResponse({"error": "Accès refusé."}, status_code=403)
+    else:
+        root = Path(ICLOUD_DEFAULT).resolve()
+        abs_path = (root / decoded).resolve()
+        try:
+            abs_path.relative_to(root)
+        except ValueError:
+            return JSONResponse({"error": "Accès refusé."}, status_code=403)
     if not abs_path.exists():
         return JSONResponse({"error": f"Fichier introuvable : {path}"}, status_code=404)
     subprocess.run(["open", str(abs_path)], check=False)
@@ -256,13 +265,23 @@ async def doc_preview(path: str = Query(...)) -> Response:
     - PDF  → servi directement (le navigateur l'affiche inline)
     - txt/md → text/plain
     - docx → HTML simple extrait via python-docx
+    `path` peut être absolu (nouveau) ou relatif à ICLOUD_DEFAULT (rétrocompat).
     """
-    root = Path(ICLOUD_DEFAULT).resolve()
-    abs_path = (root / unquote(path)).resolve()
-    try:
-        abs_path.relative_to(root)
-    except ValueError:
-        return Response(content=b"Acces refuse.", status_code=403)
+    decoded = unquote(path)
+    p = Path(decoded)
+    if p.is_absolute():
+        abs_path = p.resolve()
+        try:
+            abs_path.relative_to(Path.home())
+        except ValueError:
+            return Response(content=b"Acces refuse.", status_code=403)
+    else:
+        root = Path(ICLOUD_DEFAULT).resolve()
+        abs_path = (root / decoded).resolve()
+        try:
+            abs_path.relative_to(root)
+        except ValueError:
+            return Response(content=b"Acces refuse.", status_code=403)
     if not abs_path.exists():
         return Response(content=b"Fichier introuvable.", status_code=404)
 
