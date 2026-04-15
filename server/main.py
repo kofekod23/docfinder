@@ -20,7 +20,7 @@ from urllib.parse import unquote
 import httpx
 
 from fastapi import FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from server.indexer import ICLOUD_DEFAULT, cancel_indexation, current_job, start_indexation, upsert_points
@@ -197,6 +197,59 @@ async def doc_open(path: str = Query(...)) -> JSONResponse:
         return JSONResponse({"error": f"Fichier introuvable : {path}"}, status_code=404)
     subprocess.run(["open", str(abs_path)], check=False)
     return JSONResponse({"opened": True})
+
+
+@app.get("/doc/preview")
+async def doc_preview(path: str = Query(...)) -> Response:
+    """
+    Renvoie le contenu du document pour aperçu dans le navigateur.
+    - PDF  → servi directement (le navigateur l'affiche inline)
+    - txt/md → text/plain
+    - docx → HTML simple extrait via python-docx
+    """
+    root = Path(ICLOUD_DEFAULT).resolve()
+    abs_path = (root / unquote(path)).resolve()
+    try:
+        abs_path.relative_to(root)
+    except ValueError:
+        return Response(content=b"Acces refuse.", status_code=403)
+    if not abs_path.exists():
+        return Response(content=b"Fichier introuvable.", status_code=404)
+
+    suffix = abs_path.suffix.lower()
+
+    if suffix == ".pdf":
+        data = abs_path.read_bytes()
+        return Response(
+            content=data,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "inline"},
+        )
+
+    if suffix in {".txt", ".md"}:
+        text = abs_path.read_text(errors="replace")
+        return Response(content=text, media_type="text/plain; charset=utf-8")
+
+    if suffix in {".docx", ".doc"}:
+        try:
+            from docx import Document as DocxDocument
+            doc = DocxDocument(str(abs_path))
+            paragraphs_html = "".join(
+                f"<p>{para.text}</p>" for para in doc.paragraphs if para.text.strip()
+            )
+            html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  body{{font-family:-apple-system,sans-serif;max-width:720px;margin:2rem auto;
+       padding:0 1rem;color:#222;line-height:1.7;font-size:15px}}
+  p{{margin-bottom:.75rem}}
+</style></head>
+<body>{paragraphs_html}</body></html>"""
+            return Response(content=html, media_type="text/html; charset=utf-8")
+        except Exception as exc:
+            return Response(content=f"Erreur de lecture : {exc}", status_code=500)
+
+    return Response(content=b"Format non supporte pour l'apercu.", status_code=415)
 
 
 @app.get("/admin/tunnels")
