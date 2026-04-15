@@ -30,8 +30,10 @@ class Embedder:
 
     def __init__(self) -> None:
         """Charge le modèle en mémoire (3-5s, ~500 MB RAM)."""
-        print(f"[Embedder] Chargement du modèle '{MODEL_NAME}'…")
-        self.model = SentenceTransformer(MODEL_NAME)
+        print(f"[Embedder] Chargement du modèle '{MODEL_NAME}' (CPU)…")
+        # Forcer CPU : on encode uniquement des requêtes unitaires en local.
+        # Évite de mobiliser le GPU Metal (MPS) pour rien sur Apple Silicon.
+        self.model = SentenceTransformer(MODEL_NAME, device="cpu")
         print(f"[Embedder] Modèle prêt — {EMBEDDING_DIM} dims.")
 
     @classmethod
