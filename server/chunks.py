@@ -4,9 +4,14 @@ Générateur de chunks pour l'endpoint /chunks.
 Extrait le texte des documents, les découpe, calcule les sparse vectors YAKE,
 et émet une ligne JSON par chunk (NDJSON).
 Colab consomme ce flux pour calculer les embeddings sur GPU.
+
+Toutes les opérations bloquantes (I/O fichier, extraction PDF/DOCX, YAKE)
+tournent dans un thread pool via run_in_executor pour ne pas bloquer
+l'event loop asyncio — ce qui garantit un vrai streaming HTTP incrémental.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -65,70 +70,96 @@ def _chunk(text: str) -> list[str]:
     return result
 
 
-def _iter_files(root: Path):
+def _iter_files(root: Path) -> list[Path]:
+    result = []
     for p in root.rglob("*"):
         if p.suffix == ".icloud":
             continue
         if p.name.startswith("~$") or p.name.startswith("."):
             continue
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
-            yield p
+            result.append(p)
+    return result
+
+
+def _process_file(file_path: Path, root: Path) -> dict:
+    """Traite un fichier et retourne ses chunks + métadonnées (bloquant)."""
+    rel = str(file_path.relative_to(root))
+    doc_id = hashlib.md5(str(file_path).encode()).hexdigest()
+    suffix = file_path.suffix.lower()
+    doc_type = (
+        "pdf"  if suffix == ".pdf"            else
+        "docx" if suffix in {".docx", ".doc"} else
+        "txt"  if suffix == ".txt"            else "md"
+    )
+
+    text = _extract_text(file_path)
+    chunks = _chunk(text)
+
+    if not chunks:
+        return {"skip": True, "rel": rel}
+
+    chunk_lines = []
+    for idx, chunk_text in enumerate(chunks):
+        chunk_id = f"{doc_id}_{idx}"
+        kw_pairs = _yake_extractor.extract_keywords(chunk_text)
+        keywords = [kw for kw, _ in kw_pairs]
+        sp_i, sp_v = _build_sparse(chunk_text)
+        chunk_lines.append({
+            "type": "chunk",
+            "doc_id": doc_id,
+            "chunk_id": chunk_id,
+            "point_id": int(hashlib.md5(chunk_id.encode()).hexdigest(), 16) % (2 ** 63),
+            "title": file_path.stem,
+            "path": rel,
+            "abs_path": str(file_path),
+            "doc_type": doc_type,
+            "content": chunk_text,
+            "keywords": keywords,
+            "chunk_index": idx,
+            "sparse_indices": sp_i,
+            "sparse_values": sp_v,
+        })
+
+    return {"skip": False, "rel": rel, "chunks": chunk_lines}
 
 
 async def iter_chunks_json(path: str) -> AsyncGenerator[bytes, None]:
     """
     Génère des lignes NDJSON, une par chunk.
-    Chaque ligne contient le texte + métadonnées + sparse vector précalculé.
-    L'embedding dense est laissé à Colab.
+
+    Chaque opération bloquante (scan disque, extraction texte, YAKE) tourne
+    dans un thread pool via run_in_executor pour ne jamais bloquer l'event loop.
+    Cela garantit que FastAPI envoie chaque ligne dès qu'elle est prête,
+    sans bufferiser l'intégralité de la réponse.
     """
+    loop = asyncio.get_event_loop()
     root = Path(path).expanduser()
+
     if not root.exists():
         yield json.dumps({"error": f"Dossier introuvable : {path}"}).encode() + b"\n"
         return
 
-    files = list(_iter_files(root))
-    # Première ligne : métadonnées globales
+    # Scan disque dans un thread — peut être lent sur iCloud
+    files: list[Path] = await loop.run_in_executor(None, _iter_files, root)
+
     yield json.dumps({"type": "meta", "total_files": len(files)}).encode() + b"\n"
 
     for file_path in files:
-        rel = str(file_path.relative_to(root))
-        doc_id = hashlib.md5(str(file_path).encode()).hexdigest()
-        suffix = file_path.suffix.lower()
-        doc_type = (
-            "pdf"  if suffix == ".pdf"            else
-            "docx" if suffix in {".docx", ".doc"} else
-            "txt"  if suffix == ".txt"            else "md"
-        )
+        # Extraction + chunking + YAKE dans un thread
+        result: dict = await loop.run_in_executor(None, _process_file, file_path, root)
 
-        text = _extract_text(file_path)
-        chunks = _chunk(text)
-
-        if not chunks:
-            yield json.dumps({"type": "skip", "path": rel}).encode() + b"\n"
+        if result["skip"]:
+            yield json.dumps({"type": "skip", "path": result["rel"]}).encode() + b"\n"
             continue
 
-        yield json.dumps({"type": "file", "path": rel, "chunks": len(chunks)}).encode() + b"\n"
+        yield json.dumps({
+            "type": "file",
+            "path": result["rel"],
+            "chunks": len(result["chunks"]),
+        }).encode() + b"\n"
 
-        for idx, chunk_text in enumerate(chunks):
-            chunk_id = f"{doc_id}_{idx}"
-            kw_pairs = _yake_extractor.extract_keywords(chunk_text)
-            keywords = [kw for kw, _ in kw_pairs]
-            sp_i, sp_v = _build_sparse(chunk_text)
-
-            yield json.dumps({
-                "type": "chunk",
-                "doc_id": doc_id,
-                "chunk_id": chunk_id,
-                "point_id": int(hashlib.md5(chunk_id.encode()).hexdigest(), 16) % (2 ** 63),
-                "title": file_path.stem,
-                "path": rel,
-                "abs_path": str(file_path),
-                "doc_type": doc_type,
-                "content": chunk_text,
-                "keywords": keywords,
-                "chunk_index": idx,
-                "sparse_indices": sp_i,
-                "sparse_values": sp_v,
-            }).encode() + b"\n"
+        for chunk_data in result["chunks"]:
+            yield json.dumps(chunk_data).encode() + b"\n"
 
     yield json.dumps({"type": "done"}).encode() + b"\n"

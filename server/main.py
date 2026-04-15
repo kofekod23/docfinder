@@ -217,6 +217,7 @@ async def chunks(
     return StreamingResponse(
         iter_chunks_json(path),
         media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
 
 
