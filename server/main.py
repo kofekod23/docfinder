@@ -10,14 +10,21 @@ Démarrage :
 """
 from __future__ import annotations
 
+import asyncio
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
+from urllib.parse import unquote
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+import httpx
+
+from fastapi import FastAPI, Form, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
+from server.indexer import ICLOUD_DEFAULT, cancel_indexation, current_job, start_indexation, upsert_points
+from server.chunks import iter_chunks_json
 from server.search import SearchEngine
 from shared.schema import SearchResult
 
@@ -92,6 +99,119 @@ async def search(
             "error": error,
         },
     )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin(request: Request) -> HTMLResponse:
+    """Page d'administration — lancer une indexation."""
+    return templates.TemplateResponse(
+        "admin.html",
+        {"request": request, "default_path": ICLOUD_DEFAULT, "job": current_job()},
+    )
+
+
+@app.post("/admin/index")
+async def admin_index(
+    path: str = Form(default=ICLOUD_DEFAULT),
+    reset: bool = Form(default=False),
+) -> JSONResponse:
+    """Lance une indexation en arrière-plan."""
+    result = start_indexation(path=path.strip(), reset=reset)
+    return JSONResponse(result)
+
+
+@app.post("/admin/cancel")
+async def admin_cancel() -> JSONResponse:
+    """Annule l'indexation en cours."""
+    return JSONResponse(cancel_indexation())
+
+
+@app.get("/admin/status")
+async def admin_status() -> JSONResponse:
+    """Retourne l'état courant du job d'indexation."""
+    return JSONResponse(current_job())
+
+
+@app.get("/admin/ping")
+async def admin_ping() -> JSONResponse:
+    """Endpoint léger pour le polling Colab — pas de log."""
+    job = current_job()
+    return JSONResponse({
+        "status": job["status"],
+        "done": job["done"],
+        "total": job["total"],
+        "chunks": job["chunks"],
+        "progress_pct": job["progress_pct"],
+    })
+
+
+@app.get("/chunks")
+async def chunks(
+    path: str = Query(default=ICLOUD_DEFAULT),
+) -> StreamingResponse:
+    """
+    Endpoint NDJSON — un chunk par ligne.
+    Colab consomme ce flux pour calculer les embeddings sur GPU
+    puis écrit directement dans Qdrant via ngrok.
+    """
+    return StreamingResponse(
+        iter_chunks_json(path),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.post("/admin/upsert")
+async def admin_upsert(request: Request) -> JSONResponse:
+    """
+    Reçoit des points pré-calculés depuis Colab et les écrit dans Qdrant local.
+
+    Body JSON : liste de dicts avec les champs :
+        id             (int)
+        dense          (list[float])
+        sparse_indices (list[int], optionnel)
+        sparse_values  (list[float], optionnel)
+        payload        (dict)
+    """
+    try:
+        points_data = await request.json()
+        loop = asyncio.get_event_loop()
+        n = await loop.run_in_executor(None, upsert_points, points_data)
+        return JSONResponse({"inserted": n})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/doc/open")
+async def doc_open(path: str = Query(...)) -> JSONResponse:
+    """
+    Ouvre un document avec l'application macOS par défaut.
+    `path` est le chemin relatif stocké dans Qdrant (relatif à ICLOUD_DEFAULT).
+    """
+    root = Path(ICLOUD_DEFAULT).resolve()
+    abs_path = (root / unquote(path)).resolve()
+    try:
+        abs_path.relative_to(root)
+    except ValueError:
+        return JSONResponse({"error": "Accès refusé."}, status_code=403)
+    if not abs_path.exists():
+        return JSONResponse({"error": f"Fichier introuvable : {path}"}, status_code=404)
+    subprocess.run(["open", str(abs_path)], check=False)
+    return JSONResponse({"opened": True})
+
+
+@app.get("/admin/tunnels")
+async def admin_tunnels() -> JSONResponse:
+    """Retourne les URLs ngrok actives (qdrant + docfinder)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get("http://localhost:4040/api/tunnels", timeout=3)
+            tunnels = r.json().get("tunnels", [])
+        result = {}
+        for t in tunnels:
+            result[t["name"]] = t["public_url"]
+        return JSONResponse(result)
+    except Exception:
+        return JSONResponse({})
 
 
 @app.get("/health")
