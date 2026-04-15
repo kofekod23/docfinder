@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
@@ -34,6 +35,15 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 # Instance globale du moteur (initialisée dans lifespan)
 _engine: SearchEngine | None = None
+
+# État Colab — mis à jour par heartbeat
+_colab_state: dict = {
+    "connected": False,
+    "device": None,        # "cuda" | "cpu" | None
+    "last_seen": 0.0,      # timestamp UNIX du dernier heartbeat
+    "paused": False,       # flag pause demandée par l'UI
+}
+COLAB_TIMEOUT = 15.0       # secondes sans heartbeat = déconnecté
 
 
 @asynccontextmanager
@@ -341,3 +351,51 @@ async def admin_tunnels() -> JSONResponse:
 async def health() -> dict:
     """Endpoint de santé — vérifie que le moteur est initialisé."""
     return {"status": "ok", "engine_ready": _engine is not None}
+
+
+# ── Colab status / pause ────────────────────────────────────────────────────
+
+@app.post("/admin/colab/heartbeat")
+async def colab_heartbeat(request: Request) -> JSONResponse:
+    """
+    Reçoit un heartbeat de Colab.
+    Body JSON : {"device": "cuda"} ou {"device": "cpu"}
+    """
+    body = await request.json()
+    _colab_state["device"] = body.get("device")
+    _colab_state["last_seen"] = time.time()
+    _colab_state["connected"] = True
+    return JSONResponse({"ok": True})
+
+
+@app.get("/admin/colab/control")
+async def colab_control() -> JSONResponse:
+    """Colab interroge cet endpoint pour savoir s'il doit faire pause."""
+    return JSONResponse({"paused": _colab_state["paused"]})
+
+
+@app.post("/admin/colab/pause")
+async def colab_pause() -> JSONResponse:
+    """Met Colab en pause."""
+    _colab_state["paused"] = True
+    return JSONResponse({"paused": True})
+
+
+@app.post("/admin/colab/resume")
+async def colab_resume() -> JSONResponse:
+    """Reprend Colab après pause."""
+    _colab_state["paused"] = False
+    return JSONResponse({"paused": False})
+
+
+@app.get("/admin/colab/status")
+async def colab_status() -> JSONResponse:
+    """Retourne l'état Colab pour l'UI (connecté, device, paused)."""
+    connected = (time.time() - _colab_state["last_seen"]) < COLAB_TIMEOUT
+    if not connected and _colab_state["connected"]:
+        _colab_state["connected"] = False
+    return JSONResponse({
+        "connected": connected,
+        "device": _colab_state["device"] if connected else None,
+        "paused": _colab_state["paused"],
+    })

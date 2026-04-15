@@ -172,6 +172,26 @@
       line-height: 1.6;
     }
     .log-box p { margin: 0; }
+
+    /* Colab status */
+    .colab-status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .75rem;
+    }
+    .colab-left { display: flex; align-items: center; gap: .65rem; }
+    .badge-device {
+      display: inline-block;
+      padding: .2rem .55rem;
+      border-radius: 4px;
+      font-size: .72rem;
+      font-weight: 600;
+    }
+    .badge-gpu  { background: rgba(63,185,80,.15); border: 1px solid rgba(63,185,80,.35); color: var(--green); }
+    .badge-cpu  { background: rgba(139,148,158,.15); border: 1px solid rgba(139,148,158,.3); color: var(--muted); }
+    .badge-disc { background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.25); color: var(--red); }
   </style>
 </head>
 <body>
@@ -212,6 +232,20 @@
     <!-- Section Colab -->
     <div class="card" id="colabCard">
       <h2>Mode Colab GPU</h2>
+
+      <!-- Statut connexion Colab -->
+      <div class="colab-status" style="margin-bottom:1rem;padding:.75rem 1rem;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r)">
+        <div class="colab-left">
+          <div class="dot" id="colabDot" style="background:var(--muted)"></div>
+          <span id="colabStatusText" style="font-size:.85rem;color:var(--muted)">Déconnecté</span>
+          <span id="colabDeviceBadge" style="display:none" class="badge-device"></span>
+        </div>
+        <div style="display:flex;gap:.5rem">
+          <button id="pauseBtn" onclick="colabPause()" style="display:none;padding:.3rem .8rem;font-size:.75rem;font-weight:600;border-radius:4px;border:1px solid var(--yellow);background:rgba(210,153,34,.1);color:var(--yellow);cursor:pointer">⏸ Pause</button>
+          <button id="resumeBtn" onclick="colabResume()" style="display:none;padding:.3rem .8rem;font-size:.75rem;font-weight:600;border-radius:4px;border:1px solid var(--green);background:rgba(63,185,80,.1);color:var(--green);cursor:pointer">▶ Reprendre</button>
+        </div>
+      </div>
+
       <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem">
         Ouvrez le notebook sur Colab et collez ces URLs dans la cellule de configuration.
         Le notebook se déclenchera automatiquement dès que vous lancez une indexation.
@@ -374,6 +408,69 @@
       await fetch('/admin/cancel', { method: 'POST' });
       cancelBtn.disabled = false;
     }
+
+    // ── Colab status ────────────────────────────────────────────────────────
+    const colabDot    = document.getElementById('colabDot');
+    const colabTxt    = document.getElementById('colabStatusText');
+    const colabBadge  = document.getElementById('colabDeviceBadge');
+    const pauseBtn    = document.getElementById('pauseBtn');
+    const resumeBtn   = document.getElementById('resumeBtn');
+
+    async function refreshColabStatus() {
+      try {
+        const r = await fetch('/admin/colab/status');
+        const s = await r.json();
+
+        if (s.connected) {
+          colabDot.style.background = 'var(--green)';
+          colabDot.style.animation  = 'pulse 1s infinite';
+          colabTxt.style.color      = 'var(--green)';
+          colabTxt.textContent      = 'Colab connecté';
+
+          colabBadge.style.display = 'inline-block';
+          if (s.device === 'cuda') {
+            colabBadge.className = 'badge-device badge-gpu';
+            colabBadge.textContent = '⚡ GPU';
+          } else {
+            colabBadge.className = 'badge-device badge-cpu';
+            colabBadge.textContent = 'CPU';
+          }
+
+          if (s.paused) {
+            pauseBtn.style.display  = 'none';
+            resumeBtn.style.display = 'inline-block';
+          } else {
+            pauseBtn.style.display  = 'inline-block';
+            resumeBtn.style.display = 'none';
+          }
+        } else {
+          colabDot.style.background = 'var(--muted)';
+          colabDot.style.animation  = 'none';
+          colabTxt.style.color      = 'var(--muted)';
+          colabTxt.textContent      = 'Déconnecté';
+          colabBadge.style.display  = 'none';
+          pauseBtn.style.display    = 'none';
+          resumeBtn.style.display   = 'none';
+        }
+      } catch(e) { /* réseau */ }
+    }
+
+    async function colabPause() {
+      pauseBtn.disabled = true;
+      await fetch('/admin/colab/pause', { method: 'POST' });
+      pauseBtn.disabled = false;
+      await refreshColabStatus();
+    }
+
+    async function colabResume() {
+      resumeBtn.disabled = true;
+      await fetch('/admin/colab/resume', { method: 'POST' });
+      resumeBtn.disabled = false;
+      await refreshColabStatus();
+    }
+
+    setInterval(refreshColabStatus, 5000);
+    refreshColabStatus();
 
     loadTunnels();
 
