@@ -49,9 +49,10 @@ bash start.sh
 
 ### 2. Indexer depuis Google Colab
 
-1. Sur le Mac, démarrez ngrok : `ngrok http 8000`.
+1. Sur le Mac, démarrez le tunnel : `cloudflared tunnel --url http://localhost:8000`.
+   L'URL affichée (ex. `https://xxx.trycloudflare.com`) est **stable** — pas besoin de la changer à chaque restart.
 2. Ouvrez `colab_indexer.ipynb` dans Google Colab (**Runtime → T4 GPU**).
-3. Renseignez l'URL ngrok dans la cellule **Config** du notebook.
+3. Renseignez l'URL tunnel dans la cellule **Config** du notebook (`DOCFINDER_URL`).
 4. **Run All** — le daemon démarre automatiquement.
 5. Dans l'interface admin (`http://localhost:8000/admin`), cliquez **Lancer l'indexation**.
 
