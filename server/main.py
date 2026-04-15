@@ -18,6 +18,7 @@ from typing import List
 from urllib.parse import unquote
 
 import httpx
+from qdrant_client import QdrantClient
 
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -148,8 +149,6 @@ async def admin_ping() -> JSONResponse:
 @app.get("/admin/db", response_class=HTMLResponse)
 async def admin_db(request: Request) -> HTMLResponse:
     """Page d'état de la base Qdrant — liste des documents indexés."""
-    from qdrant_client import QdrantClient
-
     stats: dict = {"total_chunks": 0, "total_docs": 0, "by_type": {}, "docs": []}
     try:
         client = QdrantClient(url=QDRANT_URL)
