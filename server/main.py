@@ -156,6 +156,38 @@ async def admin_ping() -> JSONResponse:
     })
 
 
+@app.get("/admin/indexed-doc-ids")
+async def admin_indexed_doc_ids() -> JSONResponse:
+    """
+    Retourne l'ensemble des doc_id déjà présents dans Qdrant.
+    Colab l'utilise au démarrage pour ignorer les docs déjà indexés (reprise).
+    """
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        doc_ids: set[str] = set()
+        offset = None
+        while True:
+            results, next_offset = client.scroll(
+                collection_name=COLLECTION,
+                with_payload=["doc_id"],
+                with_vectors=False,
+                limit=1000,
+                offset=offset,
+            )
+            if not results:
+                break
+            for pt in results:
+                doc_id = (pt.payload or {}).get("doc_id", "")
+                if doc_id:
+                    doc_ids.add(doc_id)
+            if next_offset is None:
+                break
+            offset = next_offset
+        return JSONResponse({"doc_ids": list(doc_ids)})
+    except Exception as exc:
+        return JSONResponse({"doc_ids": [], "error": str(exc)})
+
+
 @app.get("/admin/db", response_class=HTMLResponse)
 async def admin_db(request: Request) -> HTMLResponse:
     """Page d'état de la base Qdrant — liste des documents indexés."""
