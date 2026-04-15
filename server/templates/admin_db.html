@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DocFinder — Base de données</title>
+  <style>
+    :root {
+      --bg:#0d1117;--surface:#161b22;--surface-2:#21262d;
+      --border:#30363d;--accent:#58a6ff;--accent-2:#79c0ff;
+      --text:#c9d1d9;--muted:#8b949e;--green:#3fb950;--red:#f85149;--r:8px;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+         font-size:15px;line-height:1.5;min-height:100vh;padding:2.5rem 1rem 4rem}
+    .wrap{max-width:860px;margin:0 auto}
+
+    .nav{display:flex;gap:1.5rem;margin-bottom:2.5rem;
+         border-bottom:1px solid var(--border);padding-bottom:1rem}
+    .nav a{color:var(--muted);text-decoration:none;font-size:.9rem;font-weight:500}
+    .nav a:hover{color:var(--text)}
+    .nav a.active{color:var(--accent)}
+
+    h1{font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:.3rem}
+    .subtitle{color:var(--muted);font-size:.875rem;margin-bottom:2rem}
+
+    .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+                gap:.75rem;margin-bottom:1.5rem}
+    .stat-card{background:var(--surface);border:1px solid var(--border);
+               border-radius:var(--r);padding:1rem 1.25rem}
+    .stat-label{font-size:.75rem;color:var(--muted);margin-bottom:.25rem}
+    .stat-value{font-size:1.75rem;font-weight:700;color:var(--accent)}
+    .stat-sub{font-size:.75rem;color:var(--muted);margin-top:.1rem}
+
+    .section-title{font-size:.9rem;font-weight:600;color:var(--text);
+                   margin:1.5rem 0 .75rem}
+
+    .filter-input{width:100%;padding:.65rem 1rem;background:var(--surface);
+                  border:1px solid var(--border);border-radius:var(--r);color:var(--text);
+                  font-size:.875rem;outline:none;margin-bottom:.75rem;transition:border-color 150ms}
+    .filter-input:focus{border-color:var(--accent)}
+    .filter-input::placeholder{color:var(--muted)}
+
+    .doc-table{width:100%;border-collapse:collapse}
+    .doc-table th{text-align:left;font-size:.75rem;font-weight:500;color:var(--muted);
+                  padding:.5rem .75rem;border-bottom:1px solid var(--border)}
+    .doc-table td{padding:.55rem .75rem;border-bottom:1px solid rgba(48,54,61,.5);
+                  font-size:.82rem;vertical-align:top}
+    .doc-table tr:hover td{background:var(--surface-2)}
+    .doc-title{color:var(--accent-2);font-weight:500}
+    .doc-path{font-family:ui-monospace,"SF Mono",monospace;font-size:.72rem;
+              color:var(--muted);word-break:break-all}
+    .doc-type{display:inline-block;padding:.15rem .45rem;border-radius:3px;
+              font-size:.7rem;font-weight:500;background:var(--surface-2);
+              border:1px solid var(--border);color:var(--muted)}
+    .doc-chunks{color:var(--text);text-align:right;white-space:nowrap}
+
+    .table-wrap{background:var(--surface);border:1px solid var(--border);
+                border-radius:var(--r);overflow:hidden}
+    .table-scroll{max-height:520px;overflow-y:auto}
+
+    .error-box{padding:.85rem 1rem;background:rgba(248,81,73,.1);
+               border:1px solid rgba(248,81,73,.35);border-radius:var(--r);
+               color:var(--red);font-size:.875rem;margin-bottom:1.5rem}
+
+    .empty{text-align:center;padding:2rem;color:var(--muted);font-size:.875rem}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <nav class="nav">
+      <a href="/">Recherche</a>
+      <a href="/admin">Indexation</a>
+      <a href="/admin/db" class="active">Base</a>
+    </nav>
+
+    <h1>État de la base</h1>
+    <p class="subtitle">Documents actuellement indexés dans Qdrant.</p>
+
+    {% if stats.error %}
+    <div class="error-box">Erreur Qdrant : {{ stats.error }}</div>
+    {% else %}
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Documents</div>
+        <div class="stat-value">{{ stats.total_docs }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Chunks indexés</div>
+        <div class="stat-value">{{ stats.total_chunks }}</div>
+        <div class="stat-sub">~{{ (stats.total_chunks / stats.total_docs)|round|int if stats.total_docs else 0 }} par doc en moy.</div>
+      </div>
+      {% for t, n in stats.by_type.items() %}
+      <div class="stat-card">
+        <div class="stat-label">{{ t | upper }}</div>
+        <div class="stat-value">{{ n }}</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="section-title">Documents indexés ({{ stats.total_docs }})</div>
+
+    <input class="filter-input" type="text" id="filterInput"
+           placeholder="Filtrer par titre ou chemin…" oninput="filterDocs()">
+
+    <div class="table-wrap">
+      <div class="table-scroll">
+        <table class="doc-table" id="docTable">
+          <thead>
+            <tr>
+              <th>Titre</th>
+              <th>Type</th>
+              <th style="text-align:right">Chunks</th>
+            </tr>
+          </thead>
+          <tbody id="docBody">
+            {% for doc in stats.docs %}
+            <tr data-search="{{ doc.title | lower }} {{ doc.path | lower }}">
+              <td>
+                <div class="doc-title">{{ doc.title }}</div>
+                <div class="doc-path">{{ doc.path }}</div>
+              </td>
+              <td><span class="doc-type">{{ doc.doc_type | upper }}</span></td>
+              <td class="doc-chunks">{{ doc.chunks }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% if not stats.docs %}
+        <div class="empty">Aucun document indexé.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% endif %}
+
+  </div>
+  <script>
+    function filterDocs() {
+      const q = document.getElementById('filterInput').value.toLowerCase();
+      document.querySelectorAll('#docBody tr').forEach(row => {
+        row.style.display = row.dataset.search.includes(q) ? '' : 'none';
+      });
+    }
+  </script>
+</body>
+</html>

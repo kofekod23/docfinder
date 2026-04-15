@@ -23,7 +23,7 @@ from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from server.indexer import ICLOUD_DEFAULT, cancel_indexation, current_job, start_indexation, upsert_points
+from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, current_job, start_indexation, upsert_points
 from server.chunks import iter_chunks_json
 from server.search import SearchEngine
 from shared.schema import SearchResult
@@ -143,6 +143,57 @@ async def admin_ping() -> JSONResponse:
         "chunks": job["chunks"],
         "progress_pct": job["progress_pct"],
     })
+
+
+@app.get("/admin/db", response_class=HTMLResponse)
+async def admin_db(request: Request) -> HTMLResponse:
+    """Page d'état de la base Qdrant — liste des documents indexés."""
+    from qdrant_client import QdrantClient
+
+    stats: dict = {"total_chunks": 0, "total_docs": 0, "by_type": {}, "docs": []}
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        docs: dict[str, dict] = {}
+
+        offset = None
+        while True:
+            results, next_offset = client.scroll(
+                collection_name=COLLECTION,
+                with_payload=["doc_id", "title", "path", "doc_type"],
+                with_vectors=False,
+                limit=500,
+                offset=offset,
+            )
+            if not results:
+                break
+            for pt in results:
+                p = pt.payload or {}
+                doc_id = p.get("doc_id", "")
+                if doc_id not in docs:
+                    docs[doc_id] = {
+                        "title": p.get("title", "?"),
+                        "path": p.get("path", ""),
+                        "doc_type": p.get("doc_type", "?"),
+                        "chunks": 0,
+                    }
+                docs[doc_id]["chunks"] += 1
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        stats["total_chunks"] = sum(d["chunks"] for d in docs.values())
+        stats["total_docs"] = len(docs)
+        for d in docs.values():
+            t = d["doc_type"]
+            stats["by_type"][t] = stats["by_type"].get(t, 0) + 1
+        stats["docs"] = sorted(docs.values(), key=lambda x: x["title"].lower())
+    except Exception as exc:
+        stats["error"] = str(exc)
+
+    return templates.TemplateResponse(
+        "admin_db.html",
+        {"request": request, "stats": stats},
+    )
 
 
 @app.get("/chunks")

@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DocFinder — Indexation</title>
+  <style>
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface-2: #21262d;
+      --border:    #30363d;
+      --accent:    #58a6ff;
+      --accent-2:  #79c0ff;
+      --text:      #c9d1d9;
+      --muted:     #8b949e;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --red:       #f85149;
+      --r:         8px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      min-height: 100vh;
+      padding: 2.5rem 1rem 4rem;
+    }
+    .wrap { max-width: 700px; margin: 0 auto; }
+
+    .nav {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 2.5rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1rem;
+    }
+    .nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+    .nav a:hover { color: var(--text); }
+    .nav a.active { color: var(--accent); }
+
+    h1 { font-size: 1.5rem; font-weight: 700; color: #fff; margin-bottom: 0.3rem; }
+    .subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 2rem; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+    .card h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 1rem; color: var(--text); }
+
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.4rem; }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 0.65rem 0.9rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      color: var(--text);
+      font-size: 0.875rem;
+      font-family: ui-monospace, "SF Mono", monospace;
+      outline: none;
+      margin-bottom: 1rem;
+      transition: border-color 150ms;
+    }
+    input[type="text"]:focus { border-color: var(--accent); }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 1.25rem;
+    }
+    .checkbox-row input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+    .checkbox-row span { font-size: 0.875rem; color: var(--muted); }
+    .checkbox-row strong { color: var(--red); }
+
+    .btn {
+      padding: 0.7rem 1.4rem;
+      background: var(--accent);
+      color: #0d1117;
+      font-size: 0.875rem;
+      font-weight: 600;
+      border: none;
+      border-radius: var(--r);
+      cursor: pointer;
+      transition: background 150ms, opacity 150ms;
+    }
+    .btn:hover { background: var(--accent-2); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* Statut */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      border-radius: var(--r);
+      font-size: 0.875rem;
+      margin-bottom: 1rem;
+    }
+    .status-idle    { background: rgba(139,148,158,0.1); border: 1px solid rgba(139,148,158,0.25); color: var(--muted); }
+    .status-running { background: rgba(88,166,255,0.1);  border: 1px solid rgba(88,166,255,0.3);  color: var(--accent); }
+    .status-done    { background: rgba(63,185,80,0.1);   border: 1px solid rgba(63,185,80,0.25);  color: var(--green); }
+    .status-error   { background: rgba(248,81,73,0.1);   border: 1px solid rgba(248,81,73,0.3);   color: var(--red); }
+
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-idle    { background: var(--muted); }
+    .dot-running { background: var(--accent); animation: pulse 1s infinite; }
+    .dot-done    { background: var(--green); }
+    .dot-error   { background: var(--red); }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .progress-wrap {
+      height: 6px;
+      background: var(--surface-2);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 0.6rem;
+    }
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 400ms ease;
+    }
+
+    .stats-row {
+      display: flex;
+      gap: 1.5rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.75rem;
+    }
+    .stats-row span strong { color: var(--text); }
+
+    .current-file {
+      font-size: 0.75rem;
+      font-family: ui-monospace, "SF Mono", monospace;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 0.75rem;
+    }
+
+    .log-box {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 0.75rem 1rem;
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+      max-height: 220px;
+      overflow-y: auto;
+      line-height: 1.6;
+    }
+    .log-box p { margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <nav class="nav">
+      <a href="/">Recherche</a>
+      <a href="/admin" class="active">Indexation</a>
+      <a href="/admin/db">Base</a>
+    </nav>
+
+    <h1>Indexation</h1>
+    <p class="subtitle">Lance l'indexation des documents d'un dossier local vers Qdrant.</p>
+
+    <div class="card">
+      <h2>Nouveau job</h2>
+      <form id="indexForm">
+        <label for="pathInput">Répertoire à indexer</label>
+        <input
+          type="text"
+          id="pathInput"
+          name="path"
+          value="{{ default_path }}"
+          placeholder="/chemin/vers/documents"
+        >
+        <div class="checkbox-row">
+          <input type="checkbox" id="resetCheck" name="reset" value="true">
+          <span>
+            <strong>Réinitialiser</strong> la collection avant d'indexer
+            (supprime tous les documents existants)
+          </span>
+        </div>
+        <button class="btn" type="submit" id="startBtn">Lancer l'indexation</button>
+        <button class="btn" type="button" id="cancelBtn" style="background:var(--red);display:none;margin-left:.75rem" onclick="cancelJob()">Annuler</button>
+      </form>
+    </div>
+
+    <!-- Section Colab -->
+    <div class="card" id="colabCard">
+      <h2>Mode Colab GPU</h2>
+      <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem">
+        Ouvrez le notebook sur Colab et collez ces URLs dans la cellule de configuration.
+        Le notebook se déclenchera automatiquement dès que vous lancez une indexation.
+      </p>
+      <div id="tunnelStatus" style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">Chargement des URLs ngrok…</div>
+      <div style="display:flex;flex-direction:column;gap:.6rem" id="tunnelRows"></div>
+      <div style="margin-top:1rem">
+        <a id="colabLink"
+           href="https://colab.research.google.com/github/"
+           target="_blank"
+           style="display:inline-block;padding:.55rem 1.1rem;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);color:var(--accent);font-size:.8rem;text-decoration:none">
+          Ouvrir Colab
+        </a>
+      </div>
+    </div>
+
+    <div class="card" id="statusCard">
+      <h2>Progression</h2>
+
+      <div class="status-bar status-{{ job.status }}" id="statusBar">
+        <div class="dot dot-{{ job.status }}" id="dot"></div>
+        <span id="statusText">{{ job.status }}</span>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-bar" id="progressBar" style="width: {{ job.progress_pct }}%"></div>
+      </div>
+
+      <div class="stats-row" id="statsRow">
+        <span>Fichiers : <strong id="statDone">{{ job.done }}</strong> / <strong id="statTotal">{{ job.total }}</strong></span>
+        <span>Chunks : <strong id="statChunks">{{ job.chunks }}</strong></span>
+        <span>Ignorés : <strong id="statSkipped">{{ job.skipped }}</strong></span>
+      </div>
+
+      <div class="current-file" id="currentFile">{{ job.current_file or '—' }}</div>
+
+      <div class="log-box" id="logBox">
+        {% for line in job.log %}
+        <p>{{ line }}</p>
+        {% endfor %}
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const form      = document.getElementById('indexForm');
+    const startBtn  = document.getElementById('startBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+    const statusBar = document.getElementById('statusBar');
+    const dot       = document.getElementById('dot');
+    const statusTxt = document.getElementById('statusText');
+    const progBar   = document.getElementById('progressBar');
+    const statDone  = document.getElementById('statDone');
+    const statTotal = document.getElementById('statTotal');
+    const statChunks= document.getElementById('statChunks');
+    const statSkip  = document.getElementById('statSkipped');
+    const curFile   = document.getElementById('currentFile');
+    const logBox    = document.getElementById('logBox');
+
+    let pollInterval = null;
+
+    function applyStatus(job) {
+      const s = job.status;
+
+      // Barre de statut
+      statusBar.className = `status-bar status-${s}`;
+      dot.className = `dot dot-${s}`;
+
+      const labels = { idle: 'En attente', running: 'Indexation en cours…', done: 'Terminé', error: 'Erreur' };
+      statusTxt.textContent = labels[s] || s;
+
+      // Progression
+      progBar.style.width = (job.progress_pct || 0) + '%';
+      statDone.textContent  = job.done;
+      statTotal.textContent = job.total;
+      statChunks.textContent= job.chunks;
+      statSkip.textContent  = job.skipped;
+      curFile.textContent   = job.current_file || '—';
+
+      // Log
+      if (job.log && job.log.length) {
+        logBox.innerHTML = job.log.map(l => `<p>${escHtml(l)}</p>`).join('');
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+
+      // Boutons
+      startBtn.disabled = (s === 'running');
+      cancelBtn.style.display = (s === 'running') ? 'inline-block' : 'none';
+
+      // Arrêt du polling
+      if ((s === 'done' || s === 'error') && pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+    }
+
+    function escHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    async function poll() {
+      try {
+        const r = await fetch('/admin/status');
+        const job = await r.json();
+        applyStatus(job);
+      } catch(e) { /* réseau coupé */ }
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      // FormData n'inclut pas les cases non cochées
+      if (!document.getElementById('resetCheck').checked) fd.delete('reset');
+
+      const r = await fetch('/admin/index', { method: 'POST', body: fd });
+      const res = await r.json();
+      if (res.error) { alert(res.error); return; }
+
+      // Démarrer le polling
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(poll, 1500);
+      poll();
+    });
+
+    // ── Tunnels ngrok ──────────────────────────────────────────────────────
+    async function loadTunnels() {
+      try {
+        const r = await fetch('/admin/tunnels');
+        const tunnels = await r.json();
+        const rows = document.getElementById('tunnelRows');
+        const status = document.getElementById('tunnelStatus');
+
+        if (!Object.keys(tunnels).length) {
+          status.textContent = 'ngrok non détecté — lancez : ngrok start --all';
+          return;
+        }
+
+        status.textContent = 'URLs actives (à coller dans le notebook Colab) :';
+        rows.innerHTML = '';
+
+        const labels = { qdrant: 'Qdrant (port 6333)', docfinder: 'DocFinder (port 8000)' };
+        for (const [name, url] of Object.entries(tunnels)) {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;align-items:center;gap:.6rem;flex-wrap:wrap';
+          row.innerHTML = `
+            <span style="font-size:.75rem;color:var(--muted);width:160px;flex-shrink:0">${labels[name] || name}</span>
+            <code style="flex:1;font-family:ui-monospace,'SF Mono',monospace;font-size:.78rem;color:var(--accent-2);background:var(--surface-2);padding:.25rem .6rem;border-radius:4px;border:1px solid var(--border)">${escHtml(url)}</code>
+            <button onclick="navigator.clipboard.writeText('${url}')" style="padding:.25rem .6rem;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--muted);font-size:.72rem;cursor:pointer">Copier</button>
+          `;
+          rows.appendChild(row);
+        }
+      } catch(e) {
+        document.getElementById('tunnelStatus').textContent = 'Impossible de charger les tunnels.';
+      }
+    }
+
+    async function cancelJob() {
+      cancelBtn.disabled = true;
+      await fetch('/admin/cancel', { method: 'POST' });
+      cancelBtn.disabled = false;
+    }
+
+    loadTunnels();
+
+    // Si un job tourne déjà au chargement de la page, on poll
+    (function() {
+      const initialStatus = '{{ job.status }}';
+      if (initialStatus === 'running') {
+        pollInterval = setInterval(poll, 1500);
+      }
+    })();
+  </script>
+</body>
+</html>
