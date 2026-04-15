@@ -81,6 +81,40 @@ def _build_sparse_vector(text: str) -> Tuple[List[int], List[float]]:
     return indices, values
 
 
+def _best_excerpt(content: str, keywords: list[str], max_chars: int = 300) -> str:
+    """
+    Sélectionne les phrases les plus riches en mots-clés pour l'extrait.
+    Si aucun mot-clé ne matche, retourne le début du contenu.
+    """
+    import re
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n', content) if s.strip()]
+    if not sentences:
+        return content[:max_chars].strip()
+
+    kw_lower = [k.lower() for k in keywords]
+
+    def score(s: str) -> int:
+        sl = s.lower()
+        return sum(1 for k in kw_lower if k in sl)
+
+    ranked = sorted(sentences, key=score, reverse=True)
+    excerpt = ""
+    for s in ranked:
+        candidate = (excerpt + " " + s).strip() if excerpt else s
+        if len(candidate) > max_chars:
+            break
+        excerpt = candidate
+        if len(excerpt) >= max_chars // 2:
+            break
+
+    if not excerpt:
+        excerpt = sentences[0]
+
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip() + "…"
+    return excerpt
+
+
 def _rrf_fusion(
     dense_hits: List[Tuple[str, float]],
     sparse_hits: List[Tuple[str, float]],
@@ -183,9 +217,8 @@ class SearchEngine:
                 continue
 
             content = payload.get("content", "")
-            excerpt = content[:300].strip()
-            if len(content) > 300:
-                excerpt += "…"
+            kw = payload.get("keywords", [])
+            excerpt = _best_excerpt(content, kw)
 
             results.append(
                 SearchResult(
