@@ -233,9 +233,10 @@ async def doc_preview(path: str = Query(...)) -> Response:
     if suffix in {".docx", ".doc"}:
         try:
             from docx import Document as DocxDocument
+            import html as _html
             doc = DocxDocument(str(abs_path))
             paragraphs_html = "".join(
-                f"<p>{para.text}</p>" for para in doc.paragraphs if para.text.strip()
+                f"<p>{_html.escape(para.text)}</p>" for para in doc.paragraphs if para.text.strip()
             )
             html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
