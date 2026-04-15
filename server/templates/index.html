@@ -172,6 +172,74 @@
       color: var(--green);
     }
 
+    /* Actions document */
+    .card-actions {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }
+    .action-btn {
+      padding: 0.3rem 0.75rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 150ms, color 150ms;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .action-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* Modal aperçu */
+    dialog {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 0;
+      width: min(90vw, 900px);
+      max-height: 90vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    dialog::backdrop { background: rgba(0,0,0,0.65); }
+    .dialog-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .dialog-title {
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 80%;
+    }
+    .dialog-close {
+      background: none;
+      border: none;
+      color: var(--muted);
+      font-size: 1.2rem;
+      cursor: pointer;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .dialog-close:hover { color: var(--text); }
+    .preview-frame {
+      flex: 1;
+      width: 100%;
+      border: none;
+      background: #fff;
+    }
+
     /* Aucun résultat */
     .empty {
       text-align: center;
@@ -187,6 +255,12 @@
 </head>
 <body>
   <div class="wrap">
+
+    <nav style="display:flex;gap:1.5rem;margin-bottom:2rem;padding-bottom:1rem;border-bottom:1px solid var(--border)">
+      <a href="/" style="color:var(--accent);font-size:.9rem;font-weight:500;text-decoration:none">Recherche</a>
+      <a href="/admin" style="color:var(--muted);font-size:.9rem;font-weight:500;text-decoration:none">Indexation</a>
+      <a href="/admin/db" style="color:var(--muted);font-size:.9rem;font-weight:500;text-decoration:none">Base</a>
+    </nav>
 
     <header class="header">
       <h1>Doc<span>Finder</span></h1>
@@ -232,6 +306,10 @@
             <span class="badge badge-kw">{{ kw }}</span>
             {% endfor %}
           </div>
+          <div class="card-actions">
+            <button class="action-btn" onclick="openDoc('{{ r.path | e }}')">↗ Ouvrir</button>
+            <button class="action-btn" onclick="previewDoc('{{ r.path | e }}', '{{ r.title | e }}')">⊡ Aperçu</button>
+          </div>
         </article>
         {% endfor %}
 
@@ -242,6 +320,34 @@
       {% endif %}
     {% endif %}
 
+    <!-- Modal aperçu -->
+    <dialog id="previewDialog">
+      <div class="dialog-header">
+        <span class="dialog-title" id="previewTitle"></span>
+        <button class="dialog-close" onclick="document.getElementById('previewDialog').close()">✕</button>
+      </div>
+      <iframe class="preview-frame" id="previewFrame" src="about:blank"></iframe>
+    </dialog>
+
   </div>
+  <script>
+    async function openDoc(path) {
+      const r = await fetch('/doc/open?path=' + encodeURIComponent(path));
+      const j = await r.json();
+      if (j.error) alert('Impossible d\'ouvrir : ' + j.error);
+    }
+
+    function previewDoc(path, title) {
+      const dialog = document.getElementById('previewDialog');
+      document.getElementById('previewTitle').textContent = title;
+      document.getElementById('previewFrame').src = '/doc/preview?path=' + encodeURIComponent(path);
+      dialog.showModal();
+    }
+
+    // Fermer en cliquant sur le backdrop
+    document.getElementById('previewDialog').addEventListener('click', function(e) {
+      if (e.target === this) this.close();
+    });
+  </script>
 </body>
 </html>
