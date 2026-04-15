@@ -1,5 +1,16 @@
 """
-Modèles Pydantic partagés entre le serveur local et le notebook Colab.
+Modèles Pydantic partagés — shared/schema.py.
+
+Ce module est le contrat de données entre le serveur local (server/) et le notebook Colab.
+Il définit les structures qui transitent via l'API REST (NDJSON /chunks → /admin/upsert).
+
+Hiérarchie des types :
+- DocumentChunk  : représentation d'un chunk prêt à indexer (Colab → Qdrant)
+- SearchQuery    : paramètres d'une recherche utilisateur (frontend → /search)
+- SearchResult   : résultat enrichi retourné au frontend (/search → UI)
+
+Note : DocType.WORD vs DocType.DOCX — le serveur utilise "docx" en string,
+le script local_indexer.py utilise l'enum DocType. Les deux doivent rester alignés.
 """
 from enum import Enum
 from typing import List
@@ -46,5 +57,5 @@ class SearchResult(BaseModel):
     abs_path: str = ""  # chemin absolu (vide pour les anciens chunks sans ce champ)
     doc_type: str
     score: float       # score RRF fusionné (dense + sparse)
-    excerpt: str       # 300 premiers caractères du chunk pour l'affichage
+    excerpt: str       # extrait pertinent sélectionné par score de mots-clés (search.py:_best_excerpt)
     keywords: List[str]  # mots-clés du chunk (pour l'affichage)

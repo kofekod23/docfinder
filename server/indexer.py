@@ -1,7 +1,25 @@
 """
-Tâche d'indexation en arrière-plan.
+Indexation en arrière-plan — server/indexer.py.
 
-Gère un seul job à la fois via un thread daemon.
+Moteur d'indexation LOCAL du serveur FastAPI. Invoqué via POST /admin/index.
+Tourne dans un thread daemon (un seul job à la fois) pour ne pas bloquer l'event loop asyncio.
+
+Flux de données :
+    fichiers disque → extraction texte → chunking → YAKE sparse vectors
+    → embeddings CPU (Embedder singleton) → upsert Qdrant local
+
+Responsabilités :
+- Scanner un répertoire récursivement (PDF, DOCX, TXT, MD)
+- Extraire le texte brut (pymupdf pour PDF, python-docx pour DOCX)
+- Découper en chunks de 1500 chars avec overlap 200
+- Générer les vecteurs dense 768-dim (paraphrase-multilingual-mpnet-base-v2) et sparse (YAKE+MD5)
+- Insérer dans Qdrant par batches de 32 points (upsert idempotent)
+- Exposer l'état du job (progression, logs, statut) via current_job()
+
+Différence avec les modules voisins :
+- server/chunks.py  : génère un flux NDJSON pour Colab (GPU) — n'insère pas dans Qdrant
+- local_indexer.py  : script CLI autonome (même logique, sans serveur web)
+- shared/embedder.py: singleton sentence-transformers, forcé sur CPU (device="cpu")
 """
 from __future__ import annotations
 
@@ -127,16 +145,33 @@ def cancel_indexation() -> dict:
 # ---------------------------------------------------------------------------
 
 def _log(msg: str) -> None:
+    """Logue msg dans le logger standard ET dans le buffer du job courant (thread-safe)."""
     log.info(msg)
     with _lock:
         _job.log_lines.append(msg)
 
 
 def _kw_index(kw: str) -> int:
+    """Hash MD5 d'un mot-clé → index entier dans l'espace sparse [0, 2^20).
+
+    Même logique que chunks.py et local_indexer.py — tous les modules doivent
+    rester synchronisés pour que les vecteurs sparse soient comparables.
+    Collisions possibles (~1/1M) : acceptables pour ce cas d'usage (D3).
+    """
     return int(hashlib.md5(kw.lower().encode()).hexdigest(), 16) % (2 ** 20)
 
 
 def _build_sparse(text: str) -> tuple[list[int], list[float]]:
+    """Construit un vecteur sparse à partir du texte via YAKE.
+
+    Étapes :
+    1. YAKE extrait les n-grammes (n≤3) avec leur score de saillance.
+    2. Le score YAKE est *inversé* (1/score) pour que les meilleurs mots-clés aient la valeur la plus haute.
+    3. Les valeurs sont normalisées dans [0, 1] par rapport au maximum.
+    4. Chaque mot-clé est hashé via _kw_index() → indice Qdrant SparseVector.
+
+    Retourne (indices, values) compatibles avec qdrant_client.models.SparseVector.
+    """
     pairs = _yake_extractor.extract_keywords(text)
     if not pairs:
         return [], []
@@ -146,6 +181,16 @@ def _build_sparse(text: str) -> tuple[list[int], list[float]]:
 
 
 def _extract_text(path: Path) -> str:
+    """Extrait le texte brut d'un fichier selon son extension.
+
+    Parseurs utilisés :
+    - .pdf   → pymupdf (fitz) — page.get_text() sur chaque page
+    - .docx  → python-docx   — paragraphes joints par \\n
+    - .txt/.md → lecture directe (errors="ignore" pour les encodages cassés)
+
+    Retourne "" en cas d'échec (fichier chiffré, corrompu, encodage inconnu).
+    Le fallback sur le chemin fichier est géré dans _run(), pas ici.
+    """
     try:
         s = path.suffix.lower()
         if s == ".pdf":
@@ -162,6 +207,12 @@ def _extract_text(path: Path) -> str:
 
 
 def _chunk(text: str) -> list[str]:
+    """Découpe le texte en chunks de CHUNK_SIZE chars avec un overlap de CHUNK_OVERLAP.
+
+    - Normalise les espaces (\\n, \\t → espace simple) avant le découpage.
+    - Overlap de 200 chars pour préserver le contexte inter-chunks (D7).
+    - Taille cible 1500 chars ≈ 300 mots ≈ fenêtre confortable pour 512 tokens.
+    """
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
@@ -173,6 +224,13 @@ def _chunk(text: str) -> list[str]:
 
 
 def _iter_files(root: Path):
+    """Générateur récursif — yield les fichiers indexables sous root.
+
+    Exclusions :
+    - .icloud  : placeholders iCloud non téléchargés (contenu absent)
+    - ~$*      : fichiers temporaires Office (Word, Excel ouvert)
+    - .*       : fichiers/dossiers cachés macOS (.DS_Store, .git, etc.)
+    """
     for p in root.rglob("*"):
         if p.suffix == ".icloud":
             continue

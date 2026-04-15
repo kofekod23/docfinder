@@ -31,10 +31,20 @@ _yake_extractor = yake.KeywordExtractor(lan="fr", n=3, dedupLim=0.7, top=20)
 
 
 def _kw_index(kw: str) -> int:
+    """Hash MD5 → indice entier dans l'espace sparse [0, 2^20).
+
+    Identique à server/indexer.py et local_indexer.py — tous les modules
+    doivent rester synchronisés pour que les vecteurs sparse soient comparables.
+    """
     return int(hashlib.md5(kw.lower().encode()).hexdigest(), 16) % (2 ** 20)
 
 
 def _build_sparse(text: str) -> tuple[list[int], list[float]]:
+    """Vecteur sparse YAKE : n-grammes → (indices, values) normalisés dans [0, 1].
+
+    Utilisé ici pour pré-calculer les sparse vectors côté serveur local avant
+    d'envoyer les chunks à Colab. Colab n'a donc qu'à ajouter les embeddings dense.
+    """
     pairs = _yake_extractor.extract_keywords(text)
     if not pairs:
         return [], []
@@ -44,6 +54,11 @@ def _build_sparse(text: str) -> tuple[list[int], list[float]]:
 
 
 def _extract_text(path: Path) -> str:
+    """Extrait le texte brut d'un fichier (bloquant — appeler via run_in_executor).
+
+    Parseurs : pymupdf (.pdf), python-docx (.docx/.doc), lecture directe (.txt/.md).
+    Retourne "" si le fichier est illisible (PDF scanné, chiffré, encodage cassé).
+    """
     try:
         s = path.suffix.lower()
         if s == ".pdf":
@@ -60,6 +75,11 @@ def _extract_text(path: Path) -> str:
 
 
 def _chunk(text: str) -> list[str]:
+    """Découpe le texte normalisé en chunks de 1500 chars avec overlap 200.
+
+    Normalise d'abord les espaces/retours à la ligne en espace simple.
+    Même paramètres que server/indexer.py pour garantir la cohérence des points Qdrant.
+    """
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
@@ -71,6 +91,12 @@ def _chunk(text: str) -> list[str]:
 
 
 def _iter_files(root: Path) -> list[Path]:
+    """Retourne la liste complète des fichiers indexables sous root (bloquant).
+
+    Contrairement à server/indexer.py qui yield, retourne une liste complète
+    car le total est émis dans la ligne NDJSON {type: "meta"} avant le streaming.
+    Exclusions identiques : .icloud, ~$*, .* (cachés macOS).
+    """
     result = []
     for p in root.rglob("*"):
         if p.suffix == ".icloud":
