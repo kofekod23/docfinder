@@ -68,7 +68,7 @@ def keywords_from_weights(
     out: list[str] = []
     seen: set[str] = set()
     for tid, _ in items:
-        tok = decode([tid]).strip()
+        tok = decode([int(tid)]).strip()
         if not tok or tok.startswith("##") or tok.startswith("▁"):
             tok = tok.lstrip("#▁ ")
         if len(tok) < min_len:
