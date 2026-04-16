@@ -11,6 +11,7 @@ Démarrage :
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -28,6 +29,7 @@ from fastapi.templating import Jinja2Templates
 
 from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, colab_file_skipped, current_job, resume_if_needed, start_indexation, upsert_points
 from server.chunks import iter_chunks_json
+from server.files_api import router as files_router
 from server.search import SearchEngine
 from shared.schema import SearchResult
 
@@ -48,6 +50,9 @@ _colab_state: dict = {
 COLAB_TIMEOUT = 30.0          # secondes sans heartbeat = déconnecté (marge tunnel CF)
 COLAB_ACTIVE_TIMEOUT = 30.0   # secondes sans upsert = inactif (entre deux batchs)
 
+# Sous-répertoires à exclure de l'indexation courante (mis à jour par POST /admin/index)
+_current_job_excluded: list[str] = []
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,6 +72,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="DocFinder — Recherche hybride de documents", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+app.include_router(files_router)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -131,12 +137,31 @@ async def admin(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/admin/dirs")
+async def admin_dirs(path: str = Query(default=ICLOUD_DEFAULT)) -> JSONResponse:
+    """Retourne la liste des sous-répertoires immédiats non-cachés du chemin donné."""
+    p = Path(path).expanduser()
+    if not p.exists() or not p.is_dir():
+        return JSONResponse({"dirs": []})
+    dirs = sorted(
+        d.name for d in p.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    )
+    return JSONResponse({"dirs": dirs})
+
+
 @app.post("/admin/index")
 async def admin_index(
     path: str = Form(default=ICLOUD_DEFAULT),
     reset: bool = Form(default=False),
+    excluded_dirs: str = Form(default="[]"),
 ) -> JSONResponse:
     """Lance une indexation en arrière-plan."""
+    global _current_job_excluded
+    try:
+        _current_job_excluded = json.loads(excluded_dirs)
+    except Exception:
+        _current_job_excluded = []
     result = start_indexation(path=path.strip(), reset=reset)
     return JSONResponse(result)
 
@@ -258,7 +283,7 @@ async def chunks(
     puis écrit directement dans Qdrant via ngrok.
     """
     return StreamingResponse(
-        iter_chunks_json(path),
+        iter_chunks_json(path, exclude=_current_job_excluded or None),
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
