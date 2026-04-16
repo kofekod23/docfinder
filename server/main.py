@@ -151,7 +151,12 @@ async def admin(request: Request) -> HTMLResponse:
     """Page d'administration — lancer une indexation."""
     return templates.TemplateResponse(
         "admin.html",
-        {"request": request, "default_path": ICLOUD_DEFAULT, "job": current_job()},
+        {
+            "request": request,
+            "default_path": ICLOUD_DEFAULT,
+            "job": current_job(),
+            "use_v2": os.environ.get("USE_V2", "false") == "true",
+        },
     )
 
 
