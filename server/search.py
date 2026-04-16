@@ -161,7 +161,23 @@ class SearchEngine:
         # Récupère le singleton Embedder (chargé au démarrage via lifespan)
         self.embedder = Embedder.get_instance()
         self.client = QdrantClient(url=QDRANT_URL)
+        self.qdrant = self.client  # Alias for compatibility with v2 path
+        self._embedder_v2 = None  # Lazy-loaded BGE-M3 embedder for v2 search
         print(f"[SearchEngine] Connecté à Qdrant ({QDRANT_URL}), collection '{COLLECTION_NAME}'.")
+
+    @property
+    def embedder_v2(self):
+        """Lazy-load BGE-M3 embedder for v2 search. Returns None if not available."""
+        if self._embedder_v2 is None:
+            # Import here to avoid loading at startup if USE_V2 is not set
+            try:
+                from shared.embedder_v2 import EmbedderV2
+                self._embedder_v2 = EmbedderV2()
+            except (ImportError, Exception):
+                # Embedder not available (test env) — return None
+                # The actual v2 path will fail appropriately if USE_V2 is true
+                self._embedder_v2 = None
+        return self._embedder_v2
 
     def search(self, query: str, limit: int = 10) -> List[SearchResult]:
         """

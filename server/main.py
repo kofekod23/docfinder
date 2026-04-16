@@ -31,8 +31,8 @@ from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexa
 from server.chunks import iter_chunks_json
 from server.files_api import router as files_router
 from server.admin_v2 import router as admin_v2_router, set_qdrant_client
-from server.search import SearchEngine
-from shared.schema import SearchResult
+from server.search import SearchEngine, search_v2
+from shared.schema import SearchResult, SearchQuery
 
 # Répertoire des templates Jinja2
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -92,43 +92,58 @@ async def index(request: Request) -> HTMLResponse:
     )
 
 
-@app.post("/search", response_class=HTMLResponse)
-async def search(
-    request: Request,
-    query: str = Form(...),
-    limit: int = Form(default=10),
-) -> HTMLResponse:
+def _engine_search(body: SearchQuery) -> List[SearchResult]:
     """
-    Exécute une recherche hybride et renvoie la page de résultats.
+    V1 search path: uses the default embedder and searches docfinder collection.
 
-    La vectorisation de la requête se fait localement (CPU).
-    Aucun appel externe n'est effectué.
+    Args:
+        body: SearchQuery with query and limit.
+
+    Returns:
+        List of SearchResult objects.
     """
-    results: List[SearchResult] = []
-    error: str | None = None
+    query = body.query.strip()
+    limit = max(1, min(body.limit, 50))
+    if not query:
+        return []
+    return _engine.search(query=query, limit=limit)
 
-    query = query.strip()
-    if query:
-        try:
-            loop = asyncio.get_event_loop()
+
+@app.post("/search", response_class=JSONResponse)
+async def search(body: SearchQuery) -> JSONResponse:
+    """
+    Exécute une recherche hybride et retourne les résultats en JSON.
+
+    Route vers v2 si USE_V2=true, sinon vers v1 (default).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Check USE_V2 flag at request time
+        if os.environ.get("USE_V2", "false").lower() == "true":
+            # Route to v2
             results = await loop.run_in_executor(
                 None,
-                lambda: _engine.search(query=query, limit=max(1, min(limit, 50))),
+                lambda: search_v2(
+                    _engine.qdrant,
+                    _engine.embedder_v2,
+                    body.query,
+                    collection="docfinder_v2",
+                    limit=body.limit,
+                ),
             )
-        except Exception as exc:
-            error = f"Erreur lors de la recherche : {exc}"
+        else:
+            # Route to v1
+            results = await loop.run_in_executor(None, lambda: _engine_search(body))
 
-    response = templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "results": results,
-            "query": query,
-            "error": error,
-        },
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return response
+        return JSONResponse(
+            {"status": "ok", "results": [r.model_dump() for r in results]}
+        )
+    except Exception as exc:
+        return JSONResponse(
+            {"status": "error", "message": str(exc)},
+            status_code=500,
+        )
 
 
 @app.get("/admin", response_class=HTMLResponse)
