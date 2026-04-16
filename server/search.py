@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple
 
 import yake
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
 from qdrant_client.models import NamedSparseVector, NamedVector, SparseVector
 
 from shared.embedder import QUERY_PREFIX, Embedder
@@ -81,17 +82,22 @@ def _build_sparse_vector(text: str) -> Tuple[List[int], List[float]]:
     return indices, values
 
 
-def _best_excerpt(content: str, keywords: list[str], max_chars: int = 300) -> str:
+def _best_excerpt(content: str, query_keywords: list[str], max_chars: int = 300) -> str:
     """
-    Sélectionne les phrases les plus riches en mots-clés pour l'extrait.
+    Sélectionne les phrases les plus riches en mots-clés de la *requête*.
     Si aucun mot-clé ne matche, retourne le début du contenu.
+
+    Args:
+        content:        Texte complet du chunk.
+        query_keywords: Mots-clés extraits de la requête utilisateur (pas du document).
+        max_chars:      Longueur maximale de l'extrait retourné.
     """
     import re
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n', content) if s.strip()]
     if not sentences:
         return content[:max_chars].strip()
 
-    kw_lower = [k.lower() for k in keywords]
+    kw_lower = [k.lower() for k in query_keywords]
 
     def score(s: str) -> int:
         sl = s.lower()
@@ -161,9 +167,13 @@ class SearchEngine:
         """
         Recherche hybride : dense + sparse avec fusion RRF.
 
+        Un seul résultat par document (doc_id) est retourné — le chunk dont le
+        score RRF est le plus élevé. Cela évite qu'un document avec beaucoup de
+        chunks monopolise le top-N.
+
         Args:
             query: Requête en langage naturel.
-            limit: Nombre maximum de résultats retournés.
+            limit: Nombre maximum de résultats retournés (un par document).
 
         Returns:
             Liste de SearchResult triés par score RRF décroissant.
@@ -174,12 +184,17 @@ class SearchEngine:
 
         # 2. Vecteur sparse de la requête via YAKE
         sparse_indices, sparse_values = _build_sparse_vector(query)
+        # Extraire les mots-clés textuels pour l'extrait (avant normalisation)
+        query_kw_pairs = _yake_extractor.extract_keywords(query)
+        query_keywords = [kw for kw, _ in query_kw_pairs]
 
         # 3. Recherche dense dans Qdrant
+        # On récupère plus de candidats pour compenser la déduplication par doc.
+        candidates = MAX_CANDIDATES * 3
         dense_hits_raw = self.client.search(
             collection_name=COLLECTION_NAME,
             query_vector=NamedVector(name="dense", vector=dense_vector),
-            limit=MAX_CANDIDATES,
+            limit=candidates,
             with_payload=True,
         )
 
@@ -195,7 +210,7 @@ class SearchEngine:
                         values=sparse_values,
                     ),
                 ),
-                limit=MAX_CANDIDATES,
+                limit=candidates,
                 with_payload=True,
             )
 
@@ -203,36 +218,98 @@ class SearchEngine:
         dense_list = [(str(h.id), h.score) for h in dense_hits_raw]
         sparse_list = [(str(h.id), h.score) for h in sparse_hits_raw]
 
-        # 6. Fusion RRF
-        fused = _rrf_fusion(dense_list, sparse_list)[:limit]
+        # 6. Fusion RRF (sur tous les candidats, avant déduplication)
+        fused = _rrf_fusion(dense_list, sparse_list)
 
         # 7. Reconstruction des résultats avec payload Qdrant
         payload_map: Dict[str, dict] = {}
         for hit in dense_hits_raw + sparse_hits_raw:
             payload_map[str(hit.id)] = hit.payload or {}
 
+        # 8. Déduplication par document : garde le meilleur chunk par doc_id.
+        # RRF est déjà trié par score décroissant → le premier chunk rencontré
+        # pour chaque doc_id est toujours le plus pertinent.
+        seen_docs: set[str] = set()
         results: List[SearchResult] = []
+
         for chunk_id, rrf_score in fused:
+            if len(results) >= limit:
+                break
+
             payload = payload_map.get(chunk_id)
             if not payload:
                 continue
 
+            doc_id = payload.get("doc_id", chunk_id)
+            if doc_id in seen_docs:
+                continue
+            seen_docs.add(doc_id)
+
             content = payload.get("content", "")
-            kw = payload.get("keywords", [])
-            excerpt = _best_excerpt(content, kw)
+            # Extrait basé sur les mots-clés de la requête (pas du document)
+            # pour maximiser la pertinence perçue.
+            excerpt = _best_excerpt(content, query_keywords or payload.get("keywords", []))
+
+            # Mots-clés affichés = mots-clés de la requête présents dans le contenu.
+            # Si aucun ne matche, fallback sur les 3 premiers mots-clés de la requête.
+            content_lower = content.lower()
+            relevant_kw = [kw for kw in query_keywords if kw.lower() in content_lower]
+            if not relevant_kw:
+                relevant_kw = query_keywords[:3]
 
             results.append(
                 SearchResult(
                     chunk_id=chunk_id,
-                    doc_id=payload.get("doc_id", ""),
+                    doc_id=doc_id,
                     title=payload.get("title", "Sans titre"),
                     path=payload.get("path", ""),
                     abs_path=payload.get("abs_path", ""),
                     doc_type=payload.get("doc_type", ""),
                     score=round(rrf_score, 4),
                     excerpt=excerpt,
-                    keywords=payload.get("keywords", []),
+                    keywords=relevant_kw,
                 )
             )
 
         return results
+
+
+def search_v2(qdrant, embedder, query: str,
+              collection: str = "docfinder_v2",
+              limit: int = 10,
+              prefetch_limit: int = 50) -> list[SearchResult]:
+    """Dense + sparse with RRF, then ColBERT MaxSim rerank."""
+    enc = embedder.encode([query])
+    dense_q = enc.dense[0]
+    sparse_q = qm.SparseVector(indices=enc.sparse[0][0], values=enc.sparse[0][1])
+    colbert_q = enc.colbert[0]
+
+    prefetch = [
+        qm.Prefetch(query=dense_q, using="dense", limit=prefetch_limit),
+        qm.Prefetch(query=sparse_q, using="sparse", limit=prefetch_limit),
+    ]
+
+    resp = qdrant.query_points(
+        collection_name=collection,
+        prefetch=prefetch,
+        query=colbert_q,
+        using="colbert",
+        limit=limit,
+        with_payload=True,
+    )
+
+    out: list[SearchResult] = []
+    for pt in resp.points:
+        pl = pt.payload or {}
+        out.append(SearchResult(
+            chunk_id=str(pt.id),
+            doc_id=pl.get("doc_id", ""),
+            title=pl.get("title", ""),
+            path=pl.get("path", ""),
+            abs_path=pl.get("abs_path", ""),
+            doc_type=pl.get("doc_type", ""),
+            score=float(pt.score),
+            excerpt=pl.get("content", ""),
+            keywords=pl.get("keywords_doc", []),
+        ))
+    return out
