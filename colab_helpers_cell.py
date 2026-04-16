@@ -67,17 +67,29 @@ def extractor(path, mode):
     return extract_text(path, mode=mode)
 
 
-# Jupyter/Colab ont déjà une event loop active → asyncio.run() refuse
-# (RuntimeError "cannot be called from a running event loop" sur Python 3.12+).
-# On crée une loop dédiée et on y exécute le pipeline. Elle vit en parallèle
-# de celle de Jupyter sans conflit (loops isolées par thread).
-_loop = asyncio.new_event_loop()
-try:
-    _loop.run_until_complete(run_pipeline(
-        MAC_BASE, ROOT,
-        mac_client=mac, extractor=extractor, embedder=embedder,
-        tokenizer_decode=tokenizer_decode,
-        tmp_dir=tmp, checkpoint_path=ck,
-    ))
-finally:
-    _loop.close()
+# Jupyter/Colab ont une event loop active dans le thread principal → même
+# asyncio.new_event_loop().run_until_complete() refuse ("Cannot run the event
+# loop while another loop is running", check global per-thread via
+# _get_running_loop()). Seule porte de sortie : un thread dédié qui n'a pas
+# de loop courante.
+def _run_pipeline_threaded():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_pipeline(
+            MAC_BASE, ROOT,
+            mac_client=mac, extractor=extractor, embedder=embedder,
+            tokenizer_decode=tokenizer_decode,
+            tmp_dir=tmp, checkpoint_path=ck,
+        ))
+    finally:
+        loop.close()
+
+
+_pipeline_thread = threading.Thread(
+    target=_run_pipeline_threaded, name="pipeline", daemon=False,
+)
+_pipeline_thread.start()
+print("[colab_helpers_cell] pipeline lancé (thread dédié). Join en cours…")
+_pipeline_thread.join()
+print("[colab_helpers_cell] pipeline terminé.")
