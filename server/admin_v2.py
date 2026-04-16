@@ -1,9 +1,10 @@
 """V2 admin endpoints (spec §11-§13)."""
 from __future__ import annotations
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from qdrant_client.http import models as qm
 
 from shared.schema import IndexedStateRequest, ProgressReport
@@ -78,3 +79,32 @@ def get_progress() -> dict:
                 "gpu_util_pct": 0, "vram_used_mb": 0, "chunks_per_sec": 0.0,
                 "eta_seconds": 0, "stage_counts": {}}
     return _last_progress.model_dump()
+
+
+class UpsertPointV2(BaseModel):
+    id: str
+    dense: List[float]
+    sparse_indices: List[int]
+    sparse_values: List[float]
+    colbert_vecs: List[List[float]]
+    payload: dict
+
+
+class UpsertV2Request(BaseModel):
+    points: List[UpsertPointV2]
+
+
+@router.post("/admin/upsert-v2")
+def upsert_v2(body: UpsertV2Request) -> dict:
+    q = _require_qdrant()
+    points = []
+    for p in body.points:
+        vectors: dict[str, Any] = {
+            "dense": p.dense,
+            "colbert": p.colbert_vecs,
+            "sparse": qm.SparseVector(indices=p.sparse_indices,
+                                      values=p.sparse_values),
+        }
+        points.append(qm.PointStruct(id=p.id, vector=vectors, payload=p.payload))
+    q.upsert(collection_name=_collection, points=points, wait=True)
+    return {"upserted": len(points)}

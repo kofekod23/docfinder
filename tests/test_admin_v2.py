@@ -52,3 +52,21 @@ def test_progress_post_then_get(app_and_mock):
     got = client.get("/admin/progress").json()
     assert got["done"] == 3
     assert got["current_doc"] == "x.pdf"
+
+
+def test_upsert_v2_forwards_to_qdrant(app_and_mock):
+    client, qdrant = app_and_mock
+    body = {"points": [{
+        "id": "abc",
+        "dense": [0.0] * 1024,
+        "sparse_indices": [1, 2],
+        "sparse_values": [0.5, 0.3],
+        "colbert_vecs": [[0.0] * 1024],
+        "payload": {"doc_id": "d1", "content": "hello"},
+    }]}
+    r = client.post("/admin/upsert-v2", json=body)
+    assert r.status_code == 200
+    assert qdrant.upsert.called
+    kwargs = qdrant.upsert.call_args.kwargs
+    assert kwargs["collection_name"] == "docfinder_v2"
+    assert kwargs.get("wait") is True
