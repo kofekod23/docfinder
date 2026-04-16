@@ -23,6 +23,7 @@ Différence avec les modules voisins :
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import logging
 import re
@@ -49,6 +50,18 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
 ICLOUD_DEFAULT = str(Path.home() / "Library/Mobile Documents/com~apple~CloudDocs")
 
 _yake_extractor = yake.KeywordExtractor(lan="fr", n=3, dedupLim=0.7, top=20)
+
+# QdrantClient partagé au niveau module — évite de recréer une connexion HTTP
+# à chaque upsert (D15). Thread-safe côté qdrant-client v1.12.
+_qdrant_client: QdrantClient | None = None
+
+
+def _get_client() -> QdrantClient:
+    """Retourne un QdrantClient partagé (lazy init)."""
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(url=QDRANT_URL)
+    return _qdrant_client
 
 
 class JobStatus(str, Enum):
@@ -97,8 +110,13 @@ def current_job() -> dict:
 
 
 def upsert_points(points_data: list[dict]) -> int:
-    """Insère des points (envoyés par Colab) dans Qdrant local."""
-    client = QdrantClient(url=QDRANT_URL)
+    """Insère des points (envoyés par Colab) dans Qdrant local.
+
+    wait=True : on attend l'ACK disque avant de retourner (D15). Coût
+    ~5-10 % mais garantit qu'un flush Colab réussi = données persistées.
+    En cas de crash juste après l'ACK, la reprise Colab (doc_ids) sera correcte.
+    """
+    client = _get_client()
     structs: list[PointStruct] = []
     for p in points_data:
         vector_dict: dict = {"dense": p["dense"]}
@@ -113,7 +131,7 @@ def upsert_points(points_data: list[dict]) -> int:
             payload=p["payload"],
         ))
     for i in range(0, len(structs), BATCH_SIZE):
-        client.upsert(collection_name=COLLECTION, points=structs[i : i + BATCH_SIZE], wait=False)
+        client.upsert(collection_name=COLLECTION, points=structs[i : i + BATCH_SIZE], wait=True)
     return len(structs)
 
 
@@ -195,7 +213,9 @@ def _extract_text(path: Path) -> str:
         s = path.suffix.lower()
         if s == ".pdf":
             import fitz
-            return "\n".join(p.get_text() for p in fitz.open(str(path)))
+            # Context manager : libère le handle PDF et la RAM même sur exception (D15).
+            with fitz.open(str(path)) as doc:
+                return "\n".join(p.get_text() for p in doc)
         if s in {".docx", ".doc"}:
             from docx import Document
             return "\n".join(p.text for p in Document(str(path)).paragraphs)
@@ -254,7 +274,7 @@ def _run(path: str, reset: bool) -> None:
                 _job.error = f"Dossier introuvable : {path}"
             return
 
-        client = QdrantClient(url=QDRANT_URL)
+        client = _get_client()
 
         if reset:
             _log("Réinitialisation de la collection…")
@@ -329,11 +349,18 @@ def _run(path: str, reset: bool) -> None:
                 ))
 
             for i in range(0, len(points), BATCH_SIZE):
-                client.upsert(collection_name=COLLECTION, points=points[i: i + BATCH_SIZE])
+                # wait=True pour garantir la persistence au niveau document (D15)
+                client.upsert(collection_name=COLLECTION, points=points[i: i + BATCH_SIZE], wait=True)
 
             with _lock:
                 _job.chunks += len(points)
                 _job.done += 1
+
+            # Libérer la RAM agressivement — les embeddings numpy + les PointStruct
+            # peuvent peser plusieurs centaines de MB sur un gros doc.
+            del points, embeddings
+            if _job.done % 5 == 0:
+                gc.collect()
 
         _log(f"Terminé — {_job.chunks} chunks insérés, {_job.skipped} fichiers ignorés.")
         with _lock:

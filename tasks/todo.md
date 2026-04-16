@@ -39,6 +39,18 @@
 - [x] `README.md` §4 — instructions Cloudflare Tunnel + installation cloudflared
 - [x] `DECISIONS.md` — D6 amendée, D14 ajoutée
 
+## Complété (2026-04-16) — fiabilité & vitesse indexation (D15)
+
+- [x] YAKE + sparse vectors déportés sur Colab (Mac ne fait que l'I/O)
+- [x] Flush atomique à la frontière de document (marqueur `__end_of_doc__`)
+- [x] `UPSERT_EVERY` 512 → 64 en safety net
+- [x] Checkpoint disque Colab (pickle atomique avant chaque flush)
+- [x] Retry exponentiel 3× (2s, 4s, 8s) sur `/admin/upsert`
+- [x] `with fitz.open()` + `gc.collect()` périodique (chunks.py + indexer.py)
+- [x] `QdrantClient` en singleton module (`_get_client()`)
+- [x] `wait=True` sur tous les upserts Qdrant (garantie de persistence)
+- [x] Batch GPU Colab 128 → 256 (T4 sous-utilisé avant)
+
 ## À faire (optionnel)
 
 - [ ] Tests unitaires (pytest) pour search.py et embedder.py

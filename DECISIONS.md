@@ -73,3 +73,50 @@
 **Sécurité :** Le token ne doit jamais apparaître en argv (visible dans `ps`). `start.sh` le lit via `source .env` puis passe `"$CLOUDFLARE_TUNNEL_TOKEN"` — c'est acceptable car `ps aux` sur macOS ne montre pas les env vars d'un autre user. Pour un durcissement supplémentaire, utiliser `cloudflared service install` qui stocke le token dans le keychain système.
 
 **Rétrocompat :** ngrok continue de fonctionner si `DOCFINDER_PUBLIC_URL` n'est pas défini.
+
+## D15 — Fiabilité & vitesse d'indexation Colab (2026-04-16)
+**Contexte :** Indexation lente sur Mac âgé + crashs réguliers + perte de progression à chaque redémarrage.
+
+**Diagnostic :**
+1. Le Mac calculait YAKE + sparse AVANT d'envoyer les chunks à Colab → le Mac était le goulot (YAKE est du pur Python, très coûteux).
+2. `fitz.open()` sans `with` → handles PDF et mémoire non libérés sur exception.
+3. `client.upsert(wait=False)` → Qdrant ACK avant persistence disque, possible perte silencieuse.
+4. `QdrantClient` recréé à chaque `/admin/upsert` → connexions HTTP qui s'empilent.
+5. `UPSERT_EVERY=512` côté Colab + reprise doc-level via `/admin/indexed-doc-ids` → si on flush 20 chunks sur 30 d'un doc puis crash, la reprise skippe le doc entier = chunks manquants (silent data loss).
+
+**Décisions :**
+
+**D15.a — YAKE + sparse vectors déportés sur Colab**
+- `server/chunks.py` n'émet plus YAKE/keywords/sparse — juste le texte brut des chunks
+- Colab calcule YAKE + sparse + MD5 (mêmes constantes que server/indexer.py : `lan="fr", n=3, dedupLim=0.7, top=20` + `hash % 2^20`)
+- Gain : le Mac n'a plus que l'I/O + extraction texte (pymupdf), le CPU est libéré
+- Avec une fibre 400/300, le surcoût bande passante (JSON plus verbeux) est négligeable vs le gain CPU Mac
+
+**D15.b — Flush atomique par document**
+- Le producteur NDJSON Colab pousse un marqueur `{"__end_of_doc__": doc_id}` à chaque frontière de doc
+- Le consommateur flush immédiatement les pending_points à ce marqueur
+- Garantit que `/admin/indexed-doc-ids` ne retourne jamais un doc partiellement indexé
+- Safety-net : `UPSERT_EVERY=64` pour les très gros docs (plus petit = moins à perdre)
+
+**D15.c — Checkpoint disque Colab avant chaque flush**
+- `pending_points` picklé dans `/content/docfinder_checkpoint.pkl` via écriture atomique (`os.replace`) AVANT le POST
+- Supprimé après ACK Mac
+- Si le kernel crashe entre checkpoint et ACK → au prochain run, `_load_checkpoint()` rejoue les points orphelins avant de reprendre le flux
+
+**D15.d — Retry exponentiel sur les upserts Colab → Mac**
+- 3 tentatives (2s, 4s, 8s) sur `/admin/upsert`
+- Robuste aux micro-coupures Cloudflare Tunnel, aux GC Qdrant, aux pauses réseau Colab
+
+**D15.e — `wait=True` sur les upserts Qdrant**
+- `upsert_points()` + indexation locale attendent l'ACK disque Qdrant
+- Coût perf ~5-10 % mais garantit "flush réussi côté Colab = données persistées"
+
+**D15.f — `with fitz.open()` + `gc.collect()` périodique**
+- Context manager sur tous les `fitz.open()` de `chunks.py` et `indexer.py`
+- `gc.collect()` tous les 10 fichiers (chunks.py) et 5 fichiers (indexer.py) — les embeddings numpy et PointStruct peuvent peser plusieurs centaines de MB
+
+**D15.g — `QdrantClient` au niveau module**
+- `indexer.py::_get_client()` — singleton lazy, pas de recréation par requête
+
+**D15.h — Batch GPU Colab 128 → 256**
+- T4 tient largement 256 avec `paraphrase-multilingual-mpnet-base-v2` → gain ~1,6×

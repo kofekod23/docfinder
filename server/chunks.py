@@ -1,17 +1,18 @@
 """
 Générateur de chunks pour l'endpoint /chunks.
 
-Extrait le texte des documents, les découpe, calcule les sparse vectors YAKE,
-et émet une ligne JSON par chunk (NDJSON).
-Colab consomme ce flux pour calculer les embeddings sur GPU.
+Extrait le texte des documents, les découpe en fenêtres de 1500 chars,
+et émet une ligne JSON par chunk (NDJSON). Le serveur n'émet que du texte brut :
+Colab calcule YAKE + sparse + dense côté GPU/CPU Colab (D15).
 
-Toutes les opérations bloquantes (I/O fichier, extraction PDF/DOCX, YAKE)
-tournent dans un thread pool via run_in_executor pour ne pas bloquer
-l'event loop asyncio — ce qui garantit un vrai streaming HTTP incrémental.
+Toutes les opérations bloquantes (I/O fichier, extraction PDF/DOCX) tournent
+dans un thread pool via run_in_executor pour ne pas bloquer l'event loop asyncio
+— ce qui garantit un vrai streaming HTTP incrémental.
 """
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import logging
@@ -19,38 +20,11 @@ import re
 from pathlib import Path
 from typing import AsyncGenerator
 
-import yake
-
 log = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
-
-_yake_extractor = yake.KeywordExtractor(lan="fr", n=3, dedupLim=0.7, top=20)
-
-
-def _kw_index(kw: str) -> int:
-    """Hash MD5 → indice entier dans l'espace sparse [0, 2^20).
-
-    Identique à server/indexer.py et local_indexer.py — tous les modules
-    doivent rester synchronisés pour que les vecteurs sparse soient comparables.
-    """
-    return int(hashlib.md5(kw.lower().encode()).hexdigest(), 16) % (2 ** 20)
-
-
-def _build_sparse(text: str) -> tuple[list[int], list[float]]:
-    """Vecteur sparse YAKE : n-grammes → (indices, values) normalisés dans [0, 1].
-
-    Utilisé ici pour pré-calculer les sparse vectors côté serveur local avant
-    d'envoyer les chunks à Colab. Colab n'a donc qu'à ajouter les embeddings dense.
-    """
-    pairs = _yake_extractor.extract_keywords(text)
-    if not pairs:
-        return [], []
-    raw = {_kw_index(kw): 1.0 / (s + 1e-9) for kw, s in pairs}
-    max_v = max(raw.values())
-    return list(raw.keys()), [v / max_v for v in raw.values()]
 
 
 def _extract_text(path: Path) -> str:
@@ -58,12 +32,16 @@ def _extract_text(path: Path) -> str:
 
     Parseurs : pymupdf (.pdf), python-docx (.docx/.doc), lecture directe (.txt/.md).
     Retourne "" si le fichier est illisible (PDF scanné, chiffré, encodage cassé).
+
+    Utilise un `with fitz.open()` : garantit la libération du handle et de la RAM
+    du PDF même en cas d'exception — critique sur les gros corpus (D15).
     """
     try:
         s = path.suffix.lower()
         if s == ".pdf":
             import fitz
-            return "\n".join(p.get_text() for p in fitz.open(str(path)))
+            with fitz.open(str(path)) as doc:
+                return "\n".join(p.get_text() for p in doc)
         if s in {".docx", ".doc"}:
             from docx import Document
             return "\n".join(p.text for p in Document(str(path)).paragraphs)
@@ -109,7 +87,12 @@ def _iter_files(root: Path) -> list[Path]:
 
 
 def _process_file(file_path: Path, root: Path) -> dict:
-    """Traite un fichier et retourne ses chunks + métadonnées (bloquant)."""
+    """Traite un fichier et retourne ses chunks bruts + métadonnées (bloquant).
+
+    N'effectue PAS le calcul YAKE/sparse/keywords — Colab le fait (D15).
+    Le Mac se concentre sur l'I/O et l'extraction texte ; tout le CPU-heavy
+    (YAKE pur Python) est déporté sur Colab qui a du cycle à revendre.
+    """
     rel = str(file_path.relative_to(root))
     doc_id = hashlib.md5(str(file_path).encode()).hexdigest()
     suffix = file_path.suffix.lower()
@@ -128,9 +111,6 @@ def _process_file(file_path: Path, root: Path) -> dict:
     chunk_lines = []
     for idx, chunk_text in enumerate(chunks):
         chunk_id = f"{doc_id}_{idx}"
-        kw_pairs = _yake_extractor.extract_keywords(chunk_text)
-        keywords = [kw for kw, _ in kw_pairs]
-        sp_i, sp_v = _build_sparse(chunk_text)
         chunk_lines.append({
             "type": "chunk",
             "doc_id": doc_id,
@@ -141,10 +121,7 @@ def _process_file(file_path: Path, root: Path) -> dict:
             "abs_path": str(file_path),
             "doc_type": doc_type,
             "content": chunk_text,
-            "keywords": keywords,
             "chunk_index": idx,
-            "sparse_indices": sp_i,
-            "sparse_values": sp_v,
         })
 
     return {"skip": False, "rel": rel, "chunks": chunk_lines}
@@ -171,8 +148,8 @@ async def iter_chunks_json(path: str) -> AsyncGenerator[bytes, None]:
 
     yield json.dumps({"type": "meta", "total_files": len(files)}).encode() + b"\n"
 
-    for file_path in files:
-        # Extraction + chunking + YAKE dans un thread
+    for idx, file_path in enumerate(files):
+        # Extraction + chunking dans un thread (YAKE est fait côté Colab — D15)
         result: dict = await loop.run_in_executor(None, _process_file, file_path, root)
 
         if result["skip"]:
@@ -187,5 +164,10 @@ async def iter_chunks_json(path: str) -> AsyncGenerator[bytes, None]:
 
         for chunk_data in result["chunks"]:
             yield json.dumps(chunk_data).encode() + b"\n"
+
+        # Libérer la RAM agressivement entre fichiers — sur un Mac âgé,
+        # pymupdf peut retenir plusieurs dizaines de MB par gros PDF.
+        if idx % 10 == 9:
+            gc.collect()
 
     yield json.dumps({"type": "done"}).encode() + b"\n"
