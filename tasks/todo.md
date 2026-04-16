@@ -29,6 +29,16 @@
 - [x] Commentaires enrichis — docstrings architecture dans tous les modules clés
 - [x] `DECISIONS.md` — D8 à D13 ajoutées
 
+## Complété (2026-04-16) — migration Cloudflare Tunnel
+
+- [x] `.gitignore` + `.env.example` — gestion sécurisée du token
+- [x] `start.sh` — lance cloudflared en arrière-plan depuis `.env`
+- [x] `server/main.py` — `/admin/tunnels` refondu (cloudflared + ngrok fallback)
+- [x] `server/templates/admin.html` — wording tunnel + indicateur provider/santé
+- [x] `colab_indexer.ipynb` — `DOCFINDER_URL` stable, retrait header ngrok
+- [x] `README.md` §4 — instructions Cloudflare Tunnel + installation cloudflared
+- [x] `DECISIONS.md` — D6 amendée, D14 ajoutée
+
 ## À faire (optionnel)
 
 - [ ] Tests unitaires (pytest) pour search.py et embedder.py
@@ -37,3 +47,4 @@
 - [ ] Pagination des résultats
 - [ ] Endpoint DELETE /document/{doc_id} pour supprimer de l'index
 - [ ] Support .odt et .rtf
+- [ ] Restreindre l'accès au tunnel Cloudflare via Zero Trust Access (email SSO) — actuellement l'URL publique est ouverte à quiconque la devine

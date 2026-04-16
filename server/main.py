@@ -11,6 +11,7 @@ Démarrage :
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -367,17 +368,48 @@ async def doc_preview(path: str = Query(...)) -> Response:
 
 @app.get("/admin/tunnels")
 async def admin_tunnels() -> JSONResponse:
-    """Retourne les URLs ngrok actives (qdrant + docfinder)."""
+    """
+    Retourne les URLs du tunnel exposant ce serveur à Colab.
+
+    Ordre de priorité :
+      1. Cloudflare Tunnel — URL publique stable définie dans .env
+         (DOCFINDER_PUBLIC_URL). Santé vérifiée via les métriques locales
+         de cloudflared si disponibles (port 8081 par défaut).
+      2. Fallback ngrok — API locale sur le port 4040 (rétrocompat).
+
+    La réponse expose un dict {name: url} pour l'UI admin.
+    """
+    # ── 1. Cloudflare Tunnel ────────────────────────────────────────────────
+    cf_url = os.getenv("DOCFINDER_PUBLIC_URL", "").strip()
+    if cf_url:
+        provider = "cloudflare"
+        healthy = False
+        try:
+            # cloudflared expose /ready sur son port de métriques (défaut 8081)
+            async with httpx.AsyncClient() as client:
+                r = await client.get("http://localhost:8081/ready", timeout=2)
+                healthy = r.status_code == 200
+        except Exception:
+            healthy = False  # cloudflared pas lancé ou métriques désactivées
+        return JSONResponse({
+            "provider": provider,
+            "healthy": healthy,
+            "tunnels": {"docfinder": cf_url},
+        })
+
+    # ── 2. Fallback ngrok ───────────────────────────────────────────────────
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get("http://localhost:4040/api/tunnels", timeout=3)
-            tunnels = r.json().get("tunnels", [])
-        result = {}
-        for t in tunnels:
-            result[t["name"]] = t["public_url"]
-        return JSONResponse(result)
+            ngrok_tunnels = r.json().get("tunnels", [])
+        result = {t["name"]: t["public_url"] for t in ngrok_tunnels}
+        return JSONResponse({
+            "provider": "ngrok" if result else None,
+            "healthy": bool(result),
+            "tunnels": result,
+        })
     except Exception:
-        return JSONResponse({})
+        return JSONResponse({"provider": None, "healthy": False, "tunnels": {}})
 
 
 @app.get("/admin/resources")

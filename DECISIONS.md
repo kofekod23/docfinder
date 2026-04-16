@@ -21,9 +21,10 @@
 ## D5 — Chunking dans Colab uniquement (pas au moment de la recherche)
 **Pourquoi :** Le serveur local ne dispose pas des documents. L'indexation batch (GPU Colab) est la seule source de vérité dans Qdrant.
 
-## D6 — Connexion Colab → Qdrant local via ngrok
-**Pourquoi :** Qdrant tourne en binaire natif sur la machine locale, inaccessible directement depuis Colab.  
-**Setup :** L'utilisateur lance `./ngrok http 6333` sur sa machine, colle l'URL HTTPS dans le notebook.
+## D6 — Connexion Colab → serveur FastAPI local via Cloudflare Tunnel
+**Pourquoi :** Qdrant et FastAPI tournent sur la machine locale, inaccessibles directement depuis Colab. Cloudflare Tunnel (cloudflared) expose uniquement FastAPI (port 8000) — Colab n'appelle jamais Qdrant directement, le serveur fait relais via `/admin/upsert`.  
+**Setup :** `./start.sh` lit `.env`, lance `cloudflared tunnel run --token …` en arrière-plan. L'URL publique (`DOCFINDER_PUBLIC_URL`, hostname configuré sur le dashboard Cloudflare) est **stable** entre les redémarrages.  
+**Historique :** Version initiale utilisait ngrok — remplacé par Cloudflare Tunnel le 2026-04-16 (voir D14). Le fallback ngrok est conservé dans `/admin/tunnels` pour rétrocompat.
 
 ## D7 — Chunking par paragraphes avec overlap
 **Pourquoi :** Préserve le contexte sémantique. Taille cible : 512 tokens (~400 mots), overlap 50 mots.  
@@ -53,3 +54,22 @@
 ## D13 — Forcer device="cpu" sur l'Embedder local (shared/embedder.py)
 **Pourquoi :** Sur Apple Silicon (M1/M2/M3), sentence-transformers tente d'utiliser le GPU Metal (MPS). MPS a des limitations avec certains opérateurs et consomme la mémoire partagée GPU, impactant les autres applis. Forcer `device="cpu"` garantit la stabilité et libère le GPU Metal pour d'autres usages.  
 **Décision :** `device="cpu"` hardcodé dans le singleton Embedder local. Colab utilise CUDA sans restriction.
+
+## D14 — Cloudflare Tunnel en remplacement de ngrok (2026-04-16)
+**Pourquoi :** ngrok gratuit a trop de frictions pour un usage répété depuis Colab :
+- URL random à chaque redémarrage → `NGROK_URL` à recopier dans le notebook à chaque session
+- Rate limit 40 req/min pénalise les batchs d'upsert
+- Page d'avertissement navigateur forçait un header `ngrok-skip-browser-warning`
+- Session qui expire après quelques heures d'inactivité
+- `ngrok start --all` (2 tunnels simultanés) nécessite un plan payant ou des reserved domains
+
+**Choix :** Cloudflare Tunnel (named tunnel, token dans `.env`) — gratuit, URL stable (hostname personnalisé), pas de rate limit, pas de page d'avertissement, un seul tunnel suffit (FastAPI relaie vers Qdrant).
+
+**Architecture de config :**
+- `.env` (gitignored) : `CLOUDFLARE_TUNNEL_TOKEN` + `DOCFINDER_PUBLIC_URL`
+- `start.sh` lit `.env`, lance `cloudflared tunnel run --token "$TOKEN"` en arrière-plan si le token existe
+- `/admin/tunnels` retourne `{"provider": "cloudflare"|"ngrok"|None, "healthy": bool, "tunnels": {…}}` — détecte cloudflared via `http://localhost:8081/ready` (métriques), fallback ngrok sur le port 4040
+
+**Sécurité :** Le token ne doit jamais apparaître en argv (visible dans `ps`). `start.sh` le lit via `source .env` puis passe `"$CLOUDFLARE_TUNNEL_TOKEN"` — c'est acceptable car `ps aux` sur macOS ne montre pas les env vars d'un autre user. Pour un durcissement supplémentaire, utiliser `cloudflared service install` qui stocke le token dans le keychain système.
+
+**Rétrocompat :** ngrok continue de fonctionner si `DOCFINDER_PUBLIC_URL` n'est pas défini.

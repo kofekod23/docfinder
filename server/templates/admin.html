@@ -297,10 +297,10 @@
       </div>
 
       <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem">
-        Ouvrez le notebook sur Colab et collez ces URLs dans la cellule de configuration.
+        Ouvrez le notebook sur Colab et collez cette URL dans la cellule de configuration.
         Le notebook se déclenchera automatiquement dès que vous lancez une indexation.
       </p>
-      <div id="tunnelStatus" style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">Chargement des URLs ngrok…</div>
+      <div id="tunnelStatus" style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">Chargement du tunnel…</div>
       <div style="display:flex;flex-direction:column;gap:.6rem" id="tunnelRows"></div>
       <div style="margin-top:1rem">
         <a id="colabLink"
@@ -452,20 +452,27 @@
       poll();
     });
 
-    // ── Tunnels ngrok ──────────────────────────────────────────────────────
+    // ── Tunnel (Cloudflare par défaut, ngrok en fallback) ──────────────────
     async function loadTunnels() {
       try {
         const r = await fetch('/admin/tunnels');
-        const tunnels = await r.json();
+        const data = await r.json();
+        const tunnels = data.tunnels || {};
+        const provider = data.provider;
+        const healthy  = data.healthy;
         const rows = document.getElementById('tunnelRows');
         const status = document.getElementById('tunnelStatus');
 
         if (!Object.keys(tunnels).length) {
-          status.textContent = 'ngrok non détecté — lancez : ngrok start --all';
+          status.textContent = 'Aucun tunnel détecté — définissez DOCFINDER_PUBLIC_URL dans .env, ou lancez cloudflared / ngrok.';
+          rows.innerHTML = '';
           return;
         }
 
-        status.textContent = 'URLs actives (à coller dans le notebook Colab) :';
+        const providerLabel = provider === 'cloudflare' ? 'Cloudflare Tunnel' : (provider === 'ngrok' ? 'ngrok (fallback)' : 'Tunnel');
+        const healthIcon = healthy ? '🟢' : '🟡';
+        const healthTxt  = healthy ? 'actif' : 'URL configurée (santé non vérifiée)';
+        status.innerHTML = `${healthIcon} <strong>${providerLabel}</strong> — ${healthTxt}. URL à coller dans le notebook Colab :`;
         rows.innerHTML = '';
 
         const labels = { qdrant: 'Qdrant (port 6333)', docfinder: 'DocFinder (port 8000)' };
