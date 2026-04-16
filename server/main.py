@@ -26,7 +26,7 @@ from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, current_job, start_indexation, upsert_points
+from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, colab_file_skipped, current_job, resume_if_needed, start_indexation, upsert_points
 from server.chunks import iter_chunks_json
 from server.search import SearchEngine
 from shared.schema import SearchResult
@@ -37,14 +37,16 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 # Instance globale du moteur (initialisée dans lifespan)
 _engine: SearchEngine | None = None
 
-# État Colab — mis à jour par heartbeat
+# État Colab — mis à jour par heartbeat et upserts
 _colab_state: dict = {
     "connected": False,
-    "device": None,        # "cuda" | "cpu" | None
-    "last_seen": 0.0,      # timestamp UNIX du dernier heartbeat
-    "paused": False,       # flag pause demandée par l'UI
+    "device": None,           # "cuda" | "cpu" | None
+    "last_seen": 0.0,         # timestamp UNIX du dernier heartbeat
+    "paused": False,          # flag pause demandée par l'UI
+    "last_activity": 0.0,     # timestamp du dernier /admin/upsert reçu
 }
-COLAB_TIMEOUT = 15.0       # secondes sans heartbeat = déconnecté
+COLAB_TIMEOUT = 30.0          # secondes sans heartbeat = déconnecté (marge tunnel CF)
+COLAB_ACTIVE_TIMEOUT = 30.0   # secondes sans upsert = inactif (entre deux batchs)
 
 
 @asynccontextmanager
@@ -58,6 +60,7 @@ async def lifespan(app: FastAPI):
     print("[DocFinder] Démarrage — chargement du moteur de recherche…")
     _engine = SearchEngine()
     print("[DocFinder] Prêt sur http://localhost:8000")
+    resume_if_needed()
     yield
     print("[DocFinder] Arrêt du serveur.")
 
@@ -98,11 +101,15 @@ async def search(
     query = query.strip()
     if query:
         try:
-            results = _engine.search(query=query, limit=max(1, min(limit, 50)))
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                None,
+                lambda: _engine.search(query=query, limit=max(1, min(limit, 50))),
+            )
         except Exception as exc:
             error = f"Erreur lors de la recherche : {exc}"
 
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         "index.html",
         {
             "request": request,
@@ -111,6 +118,8 @@ async def search(
             "error": error,
         },
     )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -150,6 +159,7 @@ async def admin_ping() -> JSONResponse:
     job = current_job()
     return JSONResponse({
         "status": job["status"],
+        "path": job["path"],
         "done": job["done"],
         "total": job["total"],
         "chunks": job["chunks"],
@@ -270,6 +280,7 @@ async def admin_upsert(request: Request) -> JSONResponse:
         points_data = await request.json()
         loop = asyncio.get_event_loop()
         n = await loop.run_in_executor(None, upsert_points, points_data)
+        _colab_state["last_activity"] = time.time()
         return JSONResponse({"inserted": n})
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -479,6 +490,21 @@ async def colab_control() -> JSONResponse:
     return JSONResponse({"paused": _colab_state["paused"]})
 
 
+@app.post("/admin/colab/skip")
+async def colab_skip(request: Request) -> JSONResponse:
+    """Reçoit le nombre de fichiers ignorés par Colab (déjà indexés).
+
+    Colab appelle cet endpoint par batches pour signaler les fichiers skippés,
+    afin que l'UI admin reflète la vraie progression même quand tout est déjà indexé.
+    """
+    body = await request.json()
+    count = int(body.get("count", 0))
+    if count > 0:
+        colab_file_skipped(count)
+        _colab_state["last_activity"] = time.time()
+    return JSONResponse({"ok": True})
+
+
 @app.post("/admin/colab/pause")
 async def colab_pause() -> JSONResponse:
     """Met Colab en pause."""
@@ -496,11 +522,14 @@ async def colab_resume() -> JSONResponse:
 @app.get("/admin/colab/status")
 async def colab_status() -> JSONResponse:
     """Retourne l'état Colab pour l'UI (connecté, device, paused)."""
-    connected = (time.time() - _colab_state["last_seen"]) < COLAB_TIMEOUT
+    now = time.time()
+    connected = (now - _colab_state["last_seen"]) < COLAB_TIMEOUT
     if not connected and _colab_state["connected"]:
         _colab_state["connected"] = False
+    active = connected and (now - _colab_state["last_activity"]) < COLAB_ACTIVE_TIMEOUT
     return JSONResponse({
         "connected": connected,
         "device": _colab_state["device"] if connected else None,
         "paused": _colab_state["paused"],
+        "active": active,
     })

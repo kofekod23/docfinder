@@ -19,7 +19,7 @@ import yake
 from qdrant_client import QdrantClient
 from qdrant_client.models import NamedSparseVector, NamedVector, SparseVector
 
-from shared.embedder import Embedder
+from shared.embedder import QUERY_PREFIX, Embedder
 from shared.schema import SearchResult
 
 # Configuration
@@ -169,7 +169,8 @@ class SearchEngine:
             Liste de SearchResult triés par score RRF décroissant.
         """
         # 1. Encodage dense de la requête (local CPU, ~50ms)
-        dense_vector = self.embedder.encode(query).tolist()
+        # Le préfixe "query: " est requis par multilingual-e5 pour la recherche.
+        dense_vector = self.embedder.encode(query, prefix=QUERY_PREFIX).tolist()
 
         # 2. Vecteur sparse de la requête via YAKE
         sparse_indices, sparse_values = _build_sparse_vector(query)

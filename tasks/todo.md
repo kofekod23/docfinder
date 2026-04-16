@@ -29,28 +29,6 @@
 - [x] Commentaires enrichis — docstrings architecture dans tous les modules clés
 - [x] `DECISIONS.md` — D8 à D13 ajoutées
 
-## Complété (2026-04-16) — migration Cloudflare Tunnel
-
-- [x] `.gitignore` + `.env.example` — gestion sécurisée du token
-- [x] `start.sh` — lance cloudflared en arrière-plan depuis `.env`
-- [x] `server/main.py` — `/admin/tunnels` refondu (cloudflared + ngrok fallback)
-- [x] `server/templates/admin.html` — wording tunnel + indicateur provider/santé
-- [x] `colab_indexer.ipynb` — `DOCFINDER_URL` stable, retrait header ngrok
-- [x] `README.md` §4 — instructions Cloudflare Tunnel + installation cloudflared
-- [x] `DECISIONS.md` — D6 amendée, D14 ajoutée
-
-## Complété (2026-04-16) — fiabilité & vitesse indexation (D15)
-
-- [x] YAKE + sparse vectors déportés sur Colab (Mac ne fait que l'I/O)
-- [x] Flush atomique à la frontière de document (marqueur `__end_of_doc__`)
-- [x] `UPSERT_EVERY` 512 → 64 en safety net
-- [x] Checkpoint disque Colab (pickle atomique avant chaque flush)
-- [x] Retry exponentiel 3× (2s, 4s, 8s) sur `/admin/upsert`
-- [x] `with fitz.open()` + `gc.collect()` périodique (chunks.py + indexer.py)
-- [x] `QdrantClient` en singleton module (`_get_client()`)
-- [x] `wait=True` sur tous les upserts Qdrant (garantie de persistence)
-- [x] Batch GPU Colab 128 → 256 (T4 sous-utilisé avant)
-
 ## À faire (optionnel)
 
 - [ ] Tests unitaires (pytest) pour search.py et embedder.py
@@ -59,4 +37,14 @@
 - [ ] Pagination des résultats
 - [ ] Endpoint DELETE /document/{doc_id} pour supprimer de l'index
 - [ ] Support .odt et .rtf
-- [ ] Restreindre l'accès au tunnel Cloudflare via Zero Trust Access (email SSO) — actuellement l'URL publique est ouverte à quiconque la devine
+
+## À faire — Ré-indexation des fichiers modifiés
+
+Problème : le `doc_id = md5(chemin)` ne tient pas compte du contenu ni de la date de modification.
+Un fichier modifié depuis la dernière indexation est silencieusement skippé (ses anciens chunks restent dans Qdrant).
+
+Plan (3 fichiers) :
+- [ ] `server/chunks.py` — ajouter `mtime = int(file_path.stat().st_mtime)` dans le payload de chaque chunk
+- [ ] `server/main.py` — `/admin/indexed-doc-ids` retourne `{doc_id: mtime}` au lieu d'un set
+- [ ] `colab_indexer.ipynb` — comparer `mtime` actuel vs Qdrant : si différent → supprimer les anciens chunks via `/admin/delete-doc/{doc_id}` puis ré-indexer
+- [ ] `server/main.py` — ajouter endpoint `DELETE /admin/doc/{doc_id}` (supprime tous les points d'un doc)
