@@ -67,9 +67,17 @@ def extractor(path, mode):
     return extract_text(path, mode=mode)
 
 
-asyncio.run(run_pipeline(
-    MAC_BASE, ROOT,
-    mac_client=mac, extractor=extractor, embedder=embedder,
-    tokenizer_decode=tokenizer_decode,
-    tmp_dir=tmp, checkpoint_path=ck,
-))
+# Jupyter/Colab ont déjà une event loop active → asyncio.run() refuse
+# (RuntimeError "cannot be called from a running event loop" sur Python 3.12+).
+# On crée une loop dédiée et on y exécute le pipeline. Elle vit en parallèle
+# de celle de Jupyter sans conflit (loops isolées par thread).
+_loop = asyncio.new_event_loop()
+try:
+    _loop.run_until_complete(run_pipeline(
+        MAC_BASE, ROOT,
+        mac_client=mac, extractor=extractor, embedder=embedder,
+        tokenizer_decode=tokenizer_decode,
+        tmp_dir=tmp, checkpoint_path=ck,
+    ))
+finally:
+    _loop.close()
