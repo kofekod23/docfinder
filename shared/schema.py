@@ -13,9 +13,9 @@ Note : DocType.WORD vs DocType.DOCX — le serveur utilise "docx" en string,
 le script local_indexer.py utilise l'enum DocType. Les deux doivent rester alignés.
 """
 from enum import Enum
-from typing import List
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class DocType(str, Enum):
@@ -59,3 +59,48 @@ class SearchResult(BaseModel):
     score: float       # score RRF fusionné (dense + sparse)
     excerpt: str       # extrait pertinent sélectionné par score de mots-clés (search.py:_best_excerpt)
     keywords: List[str]  # mots-clés du chunk (pour l'affichage)
+
+
+class DocumentChunkV2(BaseModel):
+    """Chunk BGE-M3 prêt à indexer dans docfinder_v2."""
+    doc_id: str
+    path: str
+    abs_path: str
+    doc_type: str
+    title: str
+    mtime: int
+    file_hash: str
+    content: str
+    keywords_chunk: List[str]
+    keywords_doc: List[str]
+    page_range: Optional[List[int]] = None
+    chunk_idx: int
+    chunk_total: int
+    dense: List[float]
+    sparse_indices: List[int]
+    sparse_values: List[float]
+    colbert_vecs: List[List[float]]
+
+    @model_validator(mode="after")
+    def _check_sparse(self) -> "DocumentChunkV2":
+        if len(self.sparse_indices) != len(self.sparse_values):
+            raise ValueError("sparse_indices and sparse_values must have same length")
+        return self
+
+
+class ProgressReport(BaseModel):
+    """Push périodique Colab → /admin/progress (spec §13)."""
+    total: int
+    done: int
+    failed: int
+    current_doc: str = ""
+    gpu_util_pct: int = 0
+    vram_used_mb: int = 0
+    chunks_per_sec: float = 0.0
+    eta_seconds: int = 0
+    stage_counts: Dict[str, int] = {}
+
+
+class IndexedStateRequest(BaseModel):
+    """Body optionnel pour POST /admin/indexed-state."""
+    doc_ids: Optional[List[str]] = None
