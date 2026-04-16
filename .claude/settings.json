@@ -1,3 +1,4 @@
 {
-  "model": "opusplan"
+  "model": "claude-opus-4-6[1m]",
+  "autoCompactWindow": 1000000
 }
