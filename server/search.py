@@ -167,15 +167,26 @@ class SearchEngine:
 
     @property
     def embedder_v2(self):
-        """Lazy-load BGE-M3 embedder for v2 search. Returns None if not available."""
+        """Lazy-load BGE-M3 encoder for v2 search.
+
+        Mac stateless (spec v2) : si `COLAB_ENCODE_URL` est défini on passe par
+        `RemoteEncoder` (HTTP → serveur Colab). Sinon on tente le wrapper local
+        (ne fonctionnera pas sur Intel Mac mais reste utile en test unitaire).
+        """
         if self._embedder_v2 is None:
-            # Import here to avoid loading at startup if USE_V2 is not set
+            import os
+            remote_url = os.environ.get("COLAB_ENCODE_URL", "").strip()
             try:
-                from shared.embedder_v2 import EmbedderV2
-                self._embedder_v2 = EmbedderV2()
-            except (ImportError, Exception):
-                # Embedder not available (test env) — return None
-                # The actual v2 path will fail appropriately if USE_V2 is true
+                if remote_url:
+                    from server.encode_client import RemoteEncoder
+                    self._embedder_v2 = RemoteEncoder()
+                    print(f"[SearchEngine] embedder_v2 = RemoteEncoder({remote_url})")
+                else:
+                    from colab.embedder_v2 import BGEM3Wrapper
+                    self._embedder_v2 = BGEM3Wrapper()
+                    print("[SearchEngine] embedder_v2 = BGEM3Wrapper (local)")
+            except Exception as exc:
+                print(f"[SearchEngine] embedder_v2 load failed: {exc}")
                 self._embedder_v2 = None
         return self._embedder_v2
 
