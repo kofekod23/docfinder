@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Any
@@ -10,6 +11,17 @@ from typing import Callable, Any
 from colab.embedder_v2 import keywords_from_weights, aggregate_doc_keywords
 from shared.chunking import chunk_paragraphs, split_paragraphs
 from shared.hashing import file_hash_for
+
+
+def _to_list(x: Any) -> list:
+    """Convertir numpy array / tensor / liste imbriquée en list Python JSON-safe."""
+    if x is None:
+        return []
+    if hasattr(x, "tolist"):
+        return x.tolist()
+    if isinstance(x, (list, tuple)):
+        return [_to_list(v) if hasattr(v, "tolist") or isinstance(v, (list, tuple)) else v for v in x]
+    return x
 
 
 class Checkpoint:
@@ -50,6 +62,9 @@ async def process_one_doc(
     mode = meta["mode"]
 
     raw = mac_client.download(abs_path)
+    if not raw:
+        print(f"[process_one_doc] SKIP empty download {doc_id[:12]} {meta['path']}", flush=True)
+        return
     tmp_path = tmp_dir / f"{doc_id}.bin"
     tmp_path.write_bytes(raw)
 
@@ -91,10 +106,10 @@ async def process_one_doc(
         }
         points.append({
             "id": f"{doc_id}_{i}",
-            "dense": enc.dense[i],
-            "sparse_indices": enc.sparse[i][0],
-            "sparse_values": enc.sparse[i][1],
-            "colbert_vecs": enc.colbert[i],
+            "dense": _to_list(enc.dense[i]),
+            "sparse_indices": _to_list(enc.sparse[i][0]),
+            "sparse_values": _to_list(enc.sparse[i][1]),
+            "colbert_vecs": _to_list(enc.colbert[i]),
             "payload": payload,
         })
 
@@ -129,6 +144,13 @@ async def run_pipeline(
             mac_client.delete_doc(meta["doc_id"])
             todo.append(meta)
 
+    max_docs_env = os.environ.get("DOCFINDER_MAX_DOCS", "").strip()
+    if max_docs_env.isdigit() and int(max_docs_env) > 0:
+        n = int(max_docs_env)
+        print(f"[run_pipeline] DOCFINDER_MAX_DOCS={n} → slice todo {len(todo)} → {n}",
+              flush=True)
+        todo = todo[:n]
+
     sem = asyncio.Semaphore(http_workers)
     done_count = 0
     failed_count = 0
@@ -147,7 +169,17 @@ async def run_pipeline(
                 ck.mark(meta["doc_id"], "done")
                 done_count += 1
             except Exception as e:  # noqa: BLE001
-                ck.mark(meta["doc_id"], f"failed:{type(e).__name__}")
+                import traceback
+                tb = traceback.format_exc().splitlines()
+                last = tb[-1] if tb else ""
+                origin = ""
+                for line in reversed(tb):
+                    if line.strip().startswith("File ") and "colab/" in line:
+                        origin = line.strip()
+                        break
+                msg = f"{type(e).__name__}: {str(e)[:180]} | {origin[:180]}"
+                ck.mark(meta["doc_id"], f"failed:{msg}")
+                print(f"[worker] FAIL {meta['doc_id'][:12]} {msg}", flush=True)
                 failed_count += 1
             if (done_count + failed_count) % 20 == 0:
                 ck.save()
