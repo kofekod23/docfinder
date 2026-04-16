@@ -30,6 +30,7 @@ from fastapi.templating import Jinja2Templates
 from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, colab_file_skipped, current_job, resume_if_needed, start_indexation, upsert_points
 from server.chunks import iter_chunks_json
 from server.files_api import router as files_router
+from server.admin_v2 import router as admin_v2_router, set_qdrant_client
 from server.search import SearchEngine
 from shared.schema import SearchResult
 
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI):
     global _engine
     print("[DocFinder] Démarrage — chargement du moteur de recherche…")
     _engine = SearchEngine()
+    set_qdrant_client(_engine.client, collection="docfinder_v2")
     print("[DocFinder] Prêt sur http://localhost:8000")
     resume_if_needed()
     yield
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="DocFinder — Recherche hybride de documents", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 app.include_router(files_router)
+app.include_router(admin_v2_router)
 
 
 @app.get("/", response_class=HTMLResponse)
