@@ -24,7 +24,7 @@ ALLOWED_EXTS: frozenset[str] = frozenset({
     ".pdf", ".docx", ".doc", ".odt", ".rtf",
     ".xlsx", ".xls", ".csv", ".tsv", ".ods",
     ".pptx", ".ppt", ".odp", ".key",
-    ".html", ".htm", ".xml", ".epub",
+    ".xml", ".epub",
     ".pages", ".numbers",
     ".json", ".yaml", ".yml",
 })
