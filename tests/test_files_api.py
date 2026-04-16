@@ -48,3 +48,25 @@ def test_files_list_rejects_root_outside_allowed(client, tmp_path: Path):
     c, _ = client
     r = c.get("/files/list", params={"root": str(tmp_path / "other")})
     assert r.status_code == 400
+
+
+def test_files_raw_streams_bytes(client):
+    c, root = client
+    r = c.get("/files/raw", params={"path": str(root / "a.pdf")})
+    assert r.status_code == 200
+    assert r.content == b"x" * 100
+    assert r.headers["content-type"] == "application/octet-stream"
+
+
+def test_files_raw_rejects_path_outside_roots(client, tmp_path: Path):
+    c, _ = client
+    outside = tmp_path / "other.pdf"
+    outside.write_bytes(b"y")
+    r = c.get("/files/raw", params={"path": str(outside)})
+    assert r.status_code == 400
+
+
+def test_files_raw_404_if_missing(client, tmp_path: Path):
+    c, root = client
+    r = c.get("/files/raw", params={"path": str(root / "nope.pdf")})
+    assert r.status_code == 404

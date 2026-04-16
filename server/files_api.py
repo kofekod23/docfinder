@@ -53,3 +53,23 @@ def files_list(root: str = Query(...)) -> List[dict]:
             "mode": mode,
         })
     return out
+
+
+@router.get("/files/raw")
+def files_raw(path: str = Query(...)) -> StreamingResponse:
+    p = Path(path).expanduser().resolve()
+    allowed = _allowed_roots()
+    if not any(str(p).startswith(str(a)) for a in allowed):
+        raise HTTPException(400, f"path not under allowed roots: {p}")
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404, f"file not found: {p}")
+
+    def stream():
+        with p.open("rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    return
+                yield chunk
+
+    return StreamingResponse(stream(), media_type="application/octet-stream")
