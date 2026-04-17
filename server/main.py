@@ -111,19 +111,41 @@ def _engine_search(body: SearchQuery) -> List[SearchResult]:
     return _engine.search(query=query, limit=limit)
 
 
-@app.post("/search", response_class=JSONResponse)
-async def search(body: SearchQuery) -> JSONResponse:
-    """
-    Exécute une recherche hybride et retourne les résultats en JSON.
+async def _parse_search_body(request: Request) -> SearchQuery:
+    ct = request.headers.get("content-type", "")
+    if "application/json" in ct:
+        data = await request.json()
+        return SearchQuery(**data)
+    form = await request.form()
+    return SearchQuery(
+        query=str(form.get("query", "")),
+        limit=int(form.get("limit", 10) or 10),
+    )
 
-    Route vers v2 si USE_V2=true, sinon vers v1 (default).
+
+@app.post("/search")
+async def search(request: Request):
     """
+    Exécute une recherche hybride.
+
+    - POST JSON (`application/json`) → réponse JSON (API + tests).
+    - POST form (`application/x-www-form-urlencoded`) → template rendu (UI).
+    Route vers v2 si USE_V2=true, sinon v1.
+    """
+    is_json = "application/json" in request.headers.get("content-type", "")
+    try:
+        body = await _parse_search_body(request)
+    except Exception as exc:
+        if is_json:
+            return JSONResponse({"status": "error", "message": str(exc)}, status_code=422)
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "results": None, "query": "", "error": str(exc)},
+        )
+
     try:
         loop = asyncio.get_event_loop()
-
-        # Check USE_V2 flag at request time
         if os.environ.get("USE_V2", "false").lower() == "true":
-            # Route to v2
             results = await loop.run_in_executor(
                 None,
                 lambda: search_v2(
@@ -135,16 +157,29 @@ async def search(body: SearchQuery) -> JSONResponse:
                 ),
             )
         else:
-            # Route to v1
             results = await loop.run_in_executor(None, lambda: _engine_search(body))
 
-        return JSONResponse(
-            {"status": "ok", "results": [r.model_dump() for r in results]}
+        if is_json:
+            return JSONResponse(
+                {"status": "ok", "results": [r.model_dump() for r in results]}
+            )
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "results": [r.model_dump() for r in results],
+                "query": body.query,
+                "error": None,
+            },
         )
     except Exception as exc:
-        return JSONResponse(
-            {"status": "error", "message": str(exc)},
-            status_code=500,
+        if is_json:
+            return JSONResponse(
+                {"status": "error", "message": str(exc)}, status_code=500
+            )
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "results": None, "query": body.query, "error": str(exc)},
         )
 
 
@@ -272,7 +307,7 @@ async def admin_db(request: Request, v: int = 2) -> HTMLResponse:
         while True:
             results, next_offset = client.scroll(
                 collection_name=collection,
-                with_payload=["doc_id", "title", "path", "doc_type"],
+                with_payload=["doc_id", "title", "path", "abs_path", "doc_type", "is_scan"],
                 with_vectors=False,
                 limit=500,
                 offset=offset,
@@ -286,9 +321,13 @@ async def admin_db(request: Request, v: int = 2) -> HTMLResponse:
                     docs[doc_id] = {
                         "title": p.get("title", "?"),
                         "path": p.get("path", ""),
+                        "abs_path": p.get("abs_path", "") or p.get("path", ""),
                         "doc_type": p.get("doc_type", "?"),
+                        "is_scan": bool(p.get("is_scan", False)),
                         "chunks": 0,
                     }
+                if p.get("is_scan"):
+                    docs[doc_id]["is_scan"] = True
                 docs[doc_id]["chunks"] += 1
             if next_offset is None:
                 break

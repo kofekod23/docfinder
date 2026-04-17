@@ -54,11 +54,42 @@
     .doc-type{display:inline-block;padding:.15rem .45rem;border-radius:3px;
               font-size:.7rem;font-weight:500;background:var(--surface-2);
               border:1px solid var(--border);color:var(--muted)}
+    .doc-scan{display:inline-block;margin-left:.3rem;padding:.15rem .45rem;
+              border-radius:3px;font-size:.7rem;font-weight:500;
+              background:rgba(249,200,75,.12);border:1px solid rgba(249,200,75,.35);
+              color:#f0c040}
     .doc-chunks{color:var(--text);text-align:right;white-space:nowrap}
+
+    .doc-actions{white-space:nowrap;text-align:right}
+    .btn-doc{display:inline-block;padding:.3rem .6rem;margin-left:.3rem;
+             background:var(--surface-2);border:1px solid var(--border);
+             border-radius:4px;color:var(--text);font-size:.72rem;font-weight:500;
+             text-decoration:none;cursor:pointer;transition:all 150ms}
+    .btn-doc:hover{border-color:var(--accent);color:var(--accent)}
+    .btn-doc[disabled]{opacity:.35;cursor:not-allowed}
 
     .table-wrap{background:var(--surface);border:1px solid var(--border);
                 border-radius:var(--r);overflow:hidden}
     .table-scroll{max-height:520px;overflow-y:auto}
+
+    .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.75);
+                    display:none;align-items:center;justify-content:center;
+                    z-index:1000;padding:2rem}
+    .modal-backdrop.open{display:flex}
+    .modal{background:var(--surface);border:1px solid var(--border);
+           border-radius:var(--r);width:100%;max-width:960px;height:85vh;
+           display:flex;flex-direction:column;overflow:hidden}
+    .modal-head{display:flex;align-items:center;justify-content:space-between;
+                padding:.75rem 1rem;border-bottom:1px solid var(--border)}
+    .modal-title{font-size:.85rem;color:var(--text);overflow:hidden;
+                 text-overflow:ellipsis;white-space:nowrap;margin-right:1rem}
+    .modal-close{background:none;border:none;color:var(--muted);font-size:1.25rem;
+                 cursor:pointer;padding:0 .4rem}
+    .modal-close:hover{color:var(--text)}
+    .modal-body{flex:1;background:#fff;overflow:auto}
+    .modal-body iframe{width:100%;height:100%;border:0;background:#fff}
+    .modal-empty{display:flex;align-items:center;justify-content:center;
+                 height:100%;color:var(--muted);font-size:.875rem;background:var(--surface)}
 
     .error-box{padding:.85rem 1rem;background:rgba(248,81,73,.1);
                border:1px solid rgba(248,81,73,.35);border-radius:var(--r);
@@ -120,6 +151,7 @@
               <th>Titre</th>
               <th>Type</th>
               <th style="text-align:right">Chunks</th>
+              <th style="text-align:right">Actions</th>
             </tr>
           </thead>
           <tbody id="docBody">
@@ -129,8 +161,25 @@
                 <div class="doc-title">{{ doc.title }}</div>
                 <div class="doc-path">{{ doc.path }}</div>
               </td>
-              <td><span class="doc-type">{{ doc.doc_type | upper }}</span></td>
+              <td>
+                <span class="doc-type">{{ doc.doc_type | upper }}</span>
+                {% if doc.is_scan %}<span class="doc-scan" title="PDF scanné (OCR)">SCAN</span>{% endif %}
+              </td>
               <td class="doc-chunks">{{ doc.chunks }}</td>
+              <td class="doc-actions">
+                {% if doc.abs_path %}
+                <button type="button" class="btn-doc"
+                        onclick="previewDoc('{{ doc.abs_path | e }}', '{{ doc.title | e }}')">
+                  Aperçu
+                </button>
+                <button type="button" class="btn-doc"
+                        onclick="openDoc('{{ doc.abs_path | e }}')">
+                  Ouvrir
+                </button>
+                {% else %}
+                <button type="button" class="btn-doc" disabled>Aperçu</button>
+                {% endif %}
+              </td>
             </tr>
             {% endfor %}
           </tbody>
@@ -144,6 +193,20 @@
     {% endif %}
 
   </div>
+
+  <div class="modal-backdrop" id="previewModal" onclick="closePreviewIfBackdrop(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head">
+        <div class="modal-title" id="previewTitle">Aperçu</div>
+        <button type="button" class="modal-close" onclick="closePreview()"
+                aria-label="Fermer">×</button>
+      </div>
+      <div class="modal-body" id="previewBody">
+        <div class="modal-empty">Chargement…</div>
+      </div>
+    </div>
+  </div>
+
   <script>
     function filterDocs() {
       const q = document.getElementById('filterInput').value.toLowerCase();
@@ -151,6 +214,42 @@
         row.style.display = row.dataset.search.includes(q) ? '' : 'none';
       });
     }
+
+    async function openDoc(absPath) {
+      try {
+        const r = await fetch('/doc/open?path=' + encodeURIComponent(absPath));
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert('Impossible d\'ouvrir : ' + (err.error || r.status));
+        }
+      } catch (e) {
+        alert('Erreur : ' + e);
+      }
+    }
+
+    function previewDoc(absPath, title) {
+      const modal = document.getElementById('previewModal');
+      const body = document.getElementById('previewBody');
+      document.getElementById('previewTitle').textContent = title || absPath;
+      body.innerHTML = '<iframe src="/doc/preview?path='
+        + encodeURIComponent(absPath) + '"></iframe>';
+      modal.classList.add('open');
+    }
+
+    function closePreview() {
+      const modal = document.getElementById('previewModal');
+      modal.classList.remove('open');
+      document.getElementById('previewBody').innerHTML =
+        '<div class="modal-empty">Chargement…</div>';
+    }
+
+    function closePreviewIfBackdrop(event) {
+      if (event.target.id === 'previewModal') closePreview();
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closePreview();
+    });
   </script>
 </body>
 </html>

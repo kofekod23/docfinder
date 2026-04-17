@@ -41,9 +41,16 @@ class MacClient:
         else:
             print(f"[MacClient] ⚠️ AUCUN header CF Access — id={bool(cf_id)} "
                   f"secret={bool(cf_secret)}. Le Mac renverra du HTML de login.")
-        self._client = httpx.Client(transport=transport, timeout=timeout,
-                                    http2=True, follow_redirects=True,
-                                    headers=headers)
+        # upsert-v2 peut être lent côté Mac (sous-batch Qdrant 4 points + CF
+        # tunnel). On laisse un timeout de lecture large (600s) tout en gardant
+        # connect/write/pool raisonnables pour détecter vite un tunnel down.
+        self._client = httpx.Client(
+            transport=transport,
+            timeout=httpx.Timeout(timeout, read=600.0, write=timeout, pool=timeout),
+            http2=True,
+            follow_redirects=True,
+            headers=headers,
+        )
 
     def list_files(self, root: str) -> list[dict]:
         r = self._client.get(f"{self.base}/files/list", params={"root": root})
@@ -79,6 +86,8 @@ class MacClient:
         if not points:
             return {"upserted": 0}
 
+        doc_label = points[0].get("payload", {}).get("path") or "?"
+
         batches: list[list[dict]] = []
         current: list[dict] = []
         current_bytes = 0
@@ -93,6 +102,13 @@ class MacClient:
         if current:
             batches.append(current)
 
+        total_mib = sum(_estimate_point_bytes(p) for p in points) // (1024 * 1024)
+        print(
+            f"[MacClient] upsert-v2 {doc_label!r}: {len(points)} points, "
+            f"~{total_mib} MiB → {len(batches)} batch(es)",
+            flush=True,
+        )
+
         upserted = 0
         for i, batch in enumerate(batches):
             r = self._client.post(
@@ -102,9 +118,10 @@ class MacClient:
             data = r.json()
             upserted += int(data.get("upserted", len(batch)))
             if len(batches) > 1:
+                batch_mib = sum(_estimate_point_bytes(p) for p in batch) // (1024 * 1024)
                 print(
-                    f"[MacClient] upsert-v2 batch {i + 1}/{len(batches)} "
-                    f"({len(batch)} points, ~{sum(_estimate_point_bytes(p) for p in batch) // (1024 * 1024)} MiB)",
+                    f"[MacClient]   batch {i + 1}/{len(batches)} "
+                    f"({len(batch)} points, ~{batch_mib} MiB) {doc_label!r}",
                     flush=True,
                 )
         return {"upserted": upserted}

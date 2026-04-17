@@ -104,7 +104,11 @@ if command -v cloudflared &>/dev/null && [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; 
     # Le token est dans .env (gitignored).
     (
         while true; do
-            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" \
+            # --protocol http2 : QUIC/UDP flap sur macOS (UDP buffer 208 KiB
+            # vs 7168 KiB demandés par quic-go → "context canceled" loops).
+            # HTTP/2 utilise TCP et reste stable.
+            cloudflared tunnel --no-autoupdate --protocol http2 \
+                run --token "$CLOUDFLARE_TUNNEL_TOKEN" \
                 2>&1 | grep -E "connected|ERR|error|INF" || true
             echo "[cloudflared] tunnel coupé — redémarrage dans 5s…"
             sleep 5

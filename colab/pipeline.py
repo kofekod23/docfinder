@@ -103,6 +103,7 @@ async def process_one_doc(
             "path": meta["path"],
             "abs_path": abs_path,
             "doc_type": result.doc_type,
+            "is_scan": bool(getattr(result, "is_scan", False)),
             "title": Path(meta["path"]).stem,
             "mtime": meta["mtime"],
             "file_hash": file_h,

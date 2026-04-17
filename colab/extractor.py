@@ -23,6 +23,7 @@ class ExtractionResult:
     doc_type: str
     page_count: Optional[int]
     ocr_pages: tuple[int, ...] = ()
+    is_scan: bool = False
 
 
 def decide_mode(size: int, page_count: Optional[int]) -> str:
@@ -92,16 +93,21 @@ def _extract_pdf(path: Path, mode: str) -> ExtractionResult:
                     ocr_txt = ocr_fn(img)
                     if ocr_txt.strip():
                         parts.append(ocr_txt)
+                        print(f"[extractor] OCR {path.name} p{i+1}: "
+                              f"{len(ocr_txt)} chars", flush=True)
                 except Exception as e:
                     print(f"[extractor] OCR page {i} failed on {path.name}: "
                           f"{type(e).__name__}: {e}", flush=True)
             continue
         parts.append(txt)
+    processed = min(limit, total) if total else 0
+    is_scan = bool(ocr_pages) and len(ocr_pages) / max(1, processed) >= 0.5
     return ExtractionResult(
         text="\n\n".join(parts),
         doc_type="pdf",
         page_count=total,
         ocr_pages=tuple(ocr_pages),
+        is_scan=is_scan,
     )
 
 
