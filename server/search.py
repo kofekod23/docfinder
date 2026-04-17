@@ -304,8 +304,13 @@ class SearchEngine:
 def search_v2(qdrant, embedder, query: str,
               collection: str = "docfinder_v2",
               limit: int = 10,
-              prefetch_limit: int = 50) -> list[SearchResult]:
-    """Dense + sparse with RRF, then ColBERT MaxSim rerank."""
+              prefetch_limit: int = 100) -> list[SearchResult]:
+    """Dense + sparse with RRF, then ColBERT MaxSim rerank.
+
+    Déduplication par doc_id : un seul chunk par document dans le top-N.
+    Sans cela, les gros documents multi-chunks monopolisent les résultats
+    (biais lexical sur les mots fréquents).
+    """
     enc = embedder.encode([query])
     dense_q = enc.dense[0]
     sparse_q = qm.SparseVector(indices=enc.sparse[0][0], values=enc.sparse[0][1])
@@ -316,21 +321,29 @@ def search_v2(qdrant, embedder, query: str,
         qm.Prefetch(query=sparse_q, using="sparse", limit=prefetch_limit),
     ]
 
+    # Fetch ×5 pour compenser la dédup par doc_id (cf. v1 l.219-220).
     resp = qdrant.query_points(
         collection_name=collection,
         prefetch=prefetch,
         query=colbert_q,
         using="colbert",
-        limit=limit,
+        limit=limit * 5,
         with_payload=True,
     )
 
+    seen_docs: set[str] = set()
     out: list[SearchResult] = []
     for pt in resp.points:
+        if len(out) >= limit:
+            break
         pl = pt.payload or {}
+        doc_id = pl.get("doc_id", "") or str(pt.id)
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
         out.append(SearchResult(
             chunk_id=str(pt.id),
-            doc_id=pl.get("doc_id", ""),
+            doc_id=doc_id,
             title=pl.get("title", ""),
             path=pl.get("path", ""),
             abs_path=pl.get("abs_path", ""),
