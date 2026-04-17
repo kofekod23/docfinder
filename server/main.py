@@ -32,6 +32,7 @@ from server.chunks import iter_chunks_json
 from server.files_api import router as files_router
 from server.admin_v2 import router as admin_v2_router, set_qdrant_client
 from server.search import SearchEngine, search_v2
+from scripts.setup_qdrant_v2 import ensure_collection
 from shared.schema import SearchResult, SearchQuery
 
 # Répertoire des templates Jinja2
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
     global _engine
     print("[DocFinder] Démarrage — chargement du moteur de recherche…")
     _engine = SearchEngine()
+    ensure_collection(_engine.client, name="docfinder_v2")
     set_qdrant_client(_engine.client, collection="docfinder_v2")
     print("[DocFinder] Prêt sur http://localhost:8000")
     resume_if_needed()

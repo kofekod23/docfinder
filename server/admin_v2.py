@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from qdrant_client.http import models as qm
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from shared.schema import IndexedStateRequest, ProgressReport
 
@@ -35,13 +36,18 @@ def indexed_state(body: IndexedStateRequest) -> Dict[str, int]:
     offset = None
     mtimes: dict[str, int] = {}
     while True:
-        points, offset = q.scroll(
-            collection_name=_collection,
-            limit=10_000,
-            with_payload=["doc_id", "mtime"],
-            with_vectors=False,
-            offset=offset,
-        )
+        try:
+            points, offset = q.scroll(
+                collection_name=_collection,
+                limit=10_000,
+                with_payload=["doc_id", "mtime"],
+                with_vectors=False,
+                offset=offset,
+            )
+        except UnexpectedResponse as e:
+            if e.status_code == 404:
+                return {}
+            raise
         for p in points:
             pl = p.payload or {}
             doc_id = pl.get("doc_id")
