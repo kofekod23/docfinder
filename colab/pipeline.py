@@ -65,7 +65,8 @@ async def process_one_doc(
     if not raw:
         print(f"[process_one_doc] SKIP empty download {doc_id[:12]} {meta['path']}", flush=True)
         return
-    tmp_path = tmp_dir / f"{doc_id}.bin"
+    ext = Path(meta["path"]).suffix.lower() or ".bin"
+    tmp_path = tmp_dir / f"{doc_id}{ext}"
     tmp_path.write_bytes(raw)
 
     result = extractor(tmp_path, mode=mode)
