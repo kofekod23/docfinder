@@ -101,6 +101,11 @@ class UpsertV2Request(BaseModel):
     points: List[UpsertPointV2]
 
 
+# Qdrant default JSON body limit is 32 MiB. ColBERT multi-vectors push docs
+# with many chunks over that ceiling, so we fan out the upsert in sub-batches.
+_UPSERT_BATCH = 32
+
+
 @router.post("/admin/upsert-v2")
 def upsert_v2(body: UpsertV2Request) -> dict:
     q = _require_qdrant()
@@ -114,5 +119,7 @@ def upsert_v2(body: UpsertV2Request) -> dict:
         }
         pid = str(uuid.uuid5(uuid.NAMESPACE_URL, p.id))
         points.append(qm.PointStruct(id=pid, vector=vectors, payload=p.payload))
-    q.upsert(collection_name=_collection, points=points, wait=True)
+    for i in range(0, len(points), _UPSERT_BATCH):
+        q.upsert(collection_name=_collection,
+                 points=points[i:i + _UPSERT_BATCH], wait=True)
     return {"upserted": len(points)}
