@@ -14,7 +14,7 @@ import httpx
 
 # Cloudflare tunnel rejette les bodies >~100 MB (HTTP 413). On batch côté
 # client à 80 MiB pour garder une marge sous ce plafond edge.
-_UPSERT_CLIENT_SOFT_LIMIT_BYTES = 80 * 1024 * 1024
+_UPSERT_CLIENT_SOFT_LIMIT_BYTES = 24 * 1024 * 1024
 
 
 def _estimate_point_bytes(p: dict) -> int:
@@ -28,7 +28,7 @@ def _estimate_point_bytes(p: dict) -> int:
 
 class MacClient:
     def __init__(self, base_url: str, transport: Optional[httpx.BaseTransport] = None,
-                 timeout: float = 60.0):
+                 timeout: float = 180.0):
         self.base = base_url.rstrip("/")
         headers: dict[str, str] = {}
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()

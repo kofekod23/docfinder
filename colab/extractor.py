@@ -82,14 +82,22 @@ def _extract_pdf(path: Path, mode: str) -> ExtractionResult:
 
 def _extract_docx(path: Path) -> ExtractionResult:
     import docx
-    doc = docx.Document(str(path))
+    try:
+        doc = docx.Document(str(path))
+    except Exception as e:  # PackageNotFoundError, BadZipFile, ancien .doc binaire
+        print(f"[extractor] SKIP docx {path.name}: {type(e).__name__}", flush=True)
+        return ExtractionResult(text=path.name, doc_type="docx", page_count=None)
     parts = [p.text for p in doc.paragraphs if p.text.strip()]
     return ExtractionResult(text="\n\n".join(parts), doc_type="docx", page_count=None)
 
 
 def _extract_pptx(path: Path) -> ExtractionResult:
     from pptx import Presentation
-    prs = Presentation(str(path))
+    try:
+        prs = Presentation(str(path))
+    except Exception as e:
+        print(f"[extractor] SKIP pptx {path.name}: {type(e).__name__}", flush=True)
+        return ExtractionResult(text=path.name, doc_type="pptx", page_count=None)
     parts: list[str] = []
     for slide in prs.slides:
         slide_parts: list[str] = []
@@ -109,7 +117,11 @@ def _extract_pptx(path: Path) -> ExtractionResult:
 
 def _extract_xlsx(path: Path) -> ExtractionResult:
     from openpyxl import load_workbook
-    wb = load_workbook(str(path), read_only=True, data_only=True)
+    try:
+        wb = load_workbook(str(path), read_only=True, data_only=True)
+    except Exception as e:
+        print(f"[extractor] SKIP xlsx {path.name}: {type(e).__name__}", flush=True)
+        return ExtractionResult(text=path.name, doc_type="xlsx", page_count=None)
     parts: list[str] = []
     sheet_count = len(wb.worksheets)
     for ws in wb.worksheets:

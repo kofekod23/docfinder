@@ -104,7 +104,7 @@ class UpsertV2Request(BaseModel):
 # Qdrant default JSON body limit is 32 MiB. ColBERT multi-vectors dominate
 # payload size (~20 bytes per float in JSON), so we sub-batch by estimated
 # bytes rather than by point count.
-_UPSERT_SOFT_LIMIT_BYTES = 20 * 1024 * 1024
+_UPSERT_SOFT_LIMIT_BYTES = 8 * 1024 * 1024
 
 
 def _estimate_point_bytes(p: UpsertPointV2) -> int:
@@ -123,7 +123,10 @@ def upsert_v2(body: UpsertV2Request) -> dict:
         nonlocal batch, batch_bytes, upserted
         if not batch:
             return
-        q.upsert(collection_name=_collection, points=batch, wait=True)
+        # wait=False : Qdrant met en queue et retourne vite, évite 524
+        # Cloudflare (plafond edge ~100s). La cohérence est vérifiée
+        # a posteriori via /admin/indexed-state.
+        q.upsert(collection_name=_collection, points=batch, wait=False)
         upserted += len(batch)
         batch = []
         batch_bytes = 0
