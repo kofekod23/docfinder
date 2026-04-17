@@ -135,14 +135,27 @@ async def run_pipeline(
     files = mac_client.list_files(root=root)
     indexed = mac_client.indexed_state()
 
+    force_reindex = os.environ.get("DOCFINDER_FORCE_REINDEX", "").strip() == "1"
+
     todo: list[dict] = []
-    for meta in files:
-        prev_mtime = indexed.get(meta["doc_id"])
-        if prev_mtime is None:
+    if force_reindex:
+        print(
+            f"[run_pipeline] DOCFINDER_FORCE_REINDEX=1 → bypass mtime check, "
+            f"re-encode all {len(files)} files",
+            flush=True,
+        )
+        for meta in files:
+            if meta["doc_id"] in indexed:
+                mac_client.delete_doc(meta["doc_id"])
             todo.append(meta)
-        elif meta["mtime"] > prev_mtime:
-            mac_client.delete_doc(meta["doc_id"])
-            todo.append(meta)
+    else:
+        for meta in files:
+            prev_mtime = indexed.get(meta["doc_id"])
+            if prev_mtime is None:
+                todo.append(meta)
+            elif meta["mtime"] > prev_mtime:
+                mac_client.delete_doc(meta["doc_id"])
+                todo.append(meta)
 
     max_docs_env = os.environ.get("DOCFINDER_MAX_DOCS", "").strip()
     if max_docs_env.isdigit() and int(max_docs_env) > 0:
