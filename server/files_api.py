@@ -20,13 +20,10 @@ router = APIRouter()
 FIFTY_MB = 50 * 1024 * 1024
 
 ALLOWED_EXTS: frozenset[str] = frozenset({
-    ".txt", ".md", ".markdown", ".rst", ".org", ".tex",
-    ".pdf", ".docx", ".doc", ".odt", ".rtf",
-    ".xlsx", ".xls", ".csv", ".tsv", ".ods",
-    ".pptx", ".ppt", ".odp", ".key",
-    ".xml", ".epub",
-    ".pages", ".numbers",
-    ".json", ".yaml", ".yml",
+    ".pdf",
+    ".docx", ".doc",
+    ".pptx", ".ppt",
+    ".xlsx", ".xls",
 })
 
 SKIP_DIRS: frozenset[str] = frozenset({
