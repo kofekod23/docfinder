@@ -304,12 +304,13 @@ class SearchEngine:
 def search_v2(qdrant, embedder, query: str,
               collection: str = "docfinder_v2",
               limit: int = 10,
-              prefetch_limit: int = 100) -> list[SearchResult]:
-    """Dense + sparse with RRF, then ColBERT MaxSim rerank.
+              prefetch_limit: int = 200) -> list[SearchResult]:
+    """Dense + sparse prefetch, ColBERT MaxSim rerank, groupé par doc_id.
 
-    Déduplication par doc_id : un seul chunk par document dans le top-N.
-    Sans cela, les gros documents multi-chunks monopolisent les résultats
-    (biais lexical sur les mots fréquents).
+    Utilise `query_points_groups` de Qdrant pour diversifier : au plus
+    `group_size=1` chunk par document dans le top-N. Sans ce garde-fou,
+    un gros document multi-chunks monopolise la liste (chaque chunk
+    matche isolément les mots de la requête → biais lexical).
     """
     enc = embedder.encode([query])
     dense_q = enc.dense[0]
@@ -321,29 +322,26 @@ def search_v2(qdrant, embedder, query: str,
         qm.Prefetch(query=sparse_q, using="sparse", limit=prefetch_limit),
     ]
 
-    # Fetch ×5 pour compenser la dédup par doc_id (cf. v1 l.219-220).
-    resp = qdrant.query_points(
+    resp = qdrant.query_points_groups(
         collection_name=collection,
         prefetch=prefetch,
         query=colbert_q,
         using="colbert",
-        limit=limit * 5,
+        group_by="doc_id",
+        group_size=1,
+        limit=limit,
         with_payload=True,
     )
 
-    seen_docs: set[str] = set()
     out: list[SearchResult] = []
-    for pt in resp.points:
-        if len(out) >= limit:
-            break
-        pl = pt.payload or {}
-        doc_id = pl.get("doc_id", "") or str(pt.id)
-        if doc_id in seen_docs:
+    for group in resp.groups:
+        if not group.hits:
             continue
-        seen_docs.add(doc_id)
+        pt = group.hits[0]
+        pl = pt.payload or {}
         out.append(SearchResult(
             chunk_id=str(pt.id),
-            doc_id=doc_id,
+            doc_id=pl.get("doc_id", "") or str(pt.id),
             title=pl.get("title", ""),
             path=pl.get("path", ""),
             abs_path=pl.get("abs_path", ""),

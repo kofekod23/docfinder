@@ -145,7 +145,7 @@ async def search(request: Request):
 
     try:
         loop = asyncio.get_event_loop()
-        if os.environ.get("USE_V2", "false").lower() == "true":
+        if os.environ.get("USE_V2", "false").lower() in ("true", "1", "yes", "on"):
             results = await loop.run_in_executor(
                 None,
                 lambda: search_v2(
