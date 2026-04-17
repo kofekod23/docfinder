@@ -73,11 +73,17 @@
     <nav class="nav">
       <a href="/">Recherche</a>
       <a href="/admin">Indexation</a>
+      <a href="/admin/progress-view">Progression</a>
       <a href="/admin/db" class="active">Base</a>
     </nav>
 
-    <h1>État de la base</h1>
-    <p class="subtitle">Documents actuellement indexés dans Qdrant.</p>
+    <h1>État de la base <span style="font-size:.75rem;color:var(--muted);font-weight:500">({{ stats.collection }})</span></h1>
+    <p class="subtitle">
+      Documents indexés —
+      <a href="?v=2" style="color:{% if stats.version == 2 %}var(--accent){% else %}var(--muted){% endif %}">v2 (Colab GPU)</a>
+      ·
+      <a href="?v=1" style="color:{% if stats.version == 1 %}var(--accent){% else %}var(--muted){% endif %}">v1 (legacy)</a>
+    </p>
 
     {% if stats.error %}
     <div class="error-box">Erreur Qdrant : {{ stats.error }}</div>

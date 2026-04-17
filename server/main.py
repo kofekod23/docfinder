@@ -247,10 +247,21 @@ async def admin_indexed_doc_ids() -> JSONResponse:
         return JSONResponse({"doc_ids": [], "error": str(exc)})
 
 
+@app.get("/admin/progress-view", response_class=HTMLResponse)
+async def admin_progress_view(request: Request) -> HTMLResponse:
+    """Page de suivi live — poll /admin/progress toutes les 2 s."""
+    return templates.TemplateResponse("admin_progress.html", {"request": request})
+
+
 @app.get("/admin/db", response_class=HTMLResponse)
-async def admin_db(request: Request) -> HTMLResponse:
-    """Page d'état de la base Qdrant — liste des documents indexés."""
-    stats: dict = {"total_chunks": 0, "total_docs": 0, "by_type": {}, "docs": []}
+async def admin_db(request: Request, v: int = 2) -> HTMLResponse:
+    """Page d'état de la base Qdrant — liste des documents indexés.
+
+    ?v=1 → collection docfinder (legacy)
+    ?v=2 → collection docfinder_v2 (pipeline Colab, défaut)
+    """
+    collection = "docfinder_v2" if v == 2 else COLLECTION
+    stats: dict = {"total_chunks": 0, "total_docs": 0, "by_type": {}, "docs": [], "collection": collection, "version": v}
     try:
         client = QdrantClient(url=QDRANT_URL)
         docs: dict[str, dict] = {}
@@ -258,7 +269,7 @@ async def admin_db(request: Request) -> HTMLResponse:
         offset = None
         while True:
             results, next_offset = client.scroll(
-                collection_name=COLLECTION,
+                collection_name=collection,
                 with_payload=["doc_id", "title", "path", "doc_type"],
                 with_vectors=False,
                 limit=500,
