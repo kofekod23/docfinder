@@ -101,9 +101,9 @@ class UpsertV2Request(BaseModel):
     points: List[UpsertPointV2]
 
 
-# Qdrant default JSON body limit is 32 MiB. ColBERT multi-vectors push docs
-# with many chunks over that ceiling, so we fan out the upsert in sub-batches.
-_UPSERT_BATCH = 32
+# Qdrant default JSON body limit is 32 MiB. ColBERT multi-vectors weigh
+# ~1-2 MiB per chunk, so we keep batches small to stay well under the cap.
+_UPSERT_BATCH = 4
 
 
 @router.post("/admin/upsert-v2")
