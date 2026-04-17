@@ -137,6 +137,7 @@ async def run_pipeline(
     checkpoint_path: Path,
     http_workers: int = 8,
     progress_every: int = 5,
+    tokenize_len: Callable[[str], int] | None = None,
 ) -> None:
     ck = Checkpoint(checkpoint_path)
     ck.load()
@@ -184,7 +185,7 @@ async def run_pipeline(
                 await process_one_doc(
                     meta, mac_client=mac_client, extractor=extractor,
                     chunker=lambda paras: chunk_paragraphs(
-                        paras, tokenize_len=lambda t: len(t.split())),
+                        paras, tokenize_len=tokenize_len or (lambda t: len(t.split()))),
                     embedder=embedder, tokenizer_decode=tokenizer_decode,
                     tmp_dir=tmp_dir,
                 )

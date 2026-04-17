@@ -58,6 +58,13 @@ def extract_text(path: Path, mode: str) -> ExtractionResult:
     return ExtractionResult(text="", doc_type=doc_type, page_count=None)
 
 
+def _render_page_rgb(page, dpi: int = 200):
+    import numpy as np
+    pix = page.get_pixmap(dpi=dpi, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    return img[..., :3] if pix.n >= 3 else img
+
+
 def _extract_pdf(path: Path, mode: str) -> ExtractionResult:
     import fitz  # PyMuPDF
     doc = fitz.open(str(path))
@@ -65,11 +72,29 @@ def _extract_pdf(path: Path, mode: str) -> ExtractionResult:
     limit = HEAD_PAGES if mode == "head_only" else total
     parts: list[str] = []
     ocr_pages: list[int] = []
+    ocr_fn = None
     for i in range(min(limit, total)):
         page = doc.load_page(i)
         txt = page.get_text()
         if len(txt.strip()) < 10:
-            ocr_pages.append(i)  # signalled; OCR done downstream in colab/ocr.py
+            ocr_pages.append(i)
+            if ocr_fn is None:
+                try:
+                    from colab.ocr import ocr_page as ocr_fn_impl
+                    ocr_fn = ocr_fn_impl
+                except Exception as e:
+                    print(f"[extractor] OCR unavailable: {type(e).__name__}: {e}",
+                          flush=True)
+                    ocr_fn = False
+            if ocr_fn:
+                try:
+                    img = _render_page_rgb(page)
+                    ocr_txt = ocr_fn(img)
+                    if ocr_txt.strip():
+                        parts.append(ocr_txt)
+                except Exception as e:
+                    print(f"[extractor] OCR page {i} failed on {path.name}: "
+                          f"{type(e).__name__}: {e}", flush=True)
             continue
         parts.append(txt)
     return ExtractionResult(
@@ -131,7 +156,10 @@ def _extract_xlsx(path: Path) -> ExtractionResult:
             if cells:
                 sheet_parts.append(" | ".join(cells))
         if len(sheet_parts) > 1:
-            parts.append("\n".join(sheet_parts))
+            # Blank line between rows so split_paragraphs yields one paragraph per row,
+            # allowing the chunker to group them into token-sized chunks instead of
+            # accumulating an entire sheet into a single unsplittable paragraph.
+            parts.append("\n\n".join(sheet_parts))
     wb.close()
     return ExtractionResult(
         text="\n\n".join(parts), doc_type="xlsx",

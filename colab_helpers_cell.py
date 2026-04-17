@@ -47,6 +47,10 @@ mac = MacClient(MAC_BASE)
 embedder = BGEM3Wrapper()
 embedder._model_or_build()  # force load once here, avoids race with uvicorn startup
 tokenizer_decode = lambda ids: embedder._model_or_build().tokenizer.decode(ids)
+# BGE-M3 XLM-R token counter pour le chunker (spec §6) : évite le mismatch
+# mots/tokens (1.69 tokens/mot en français) qui faisait déborder hard_max.
+_xlmr_tokenizer = embedder._model_or_build().tokenizer
+tokenize_len_bgem3 = lambda t: len(_xlmr_tokenizer.encode(t, add_special_tokens=False))
 
 # Partage du wrapper avec le serveur d'encodage → un seul modèle en VRAM.
 query_server.set_wrapper(embedder)
@@ -81,6 +85,7 @@ def _run_pipeline_threaded():
             mac_client=mac, extractor=extractor, embedder=embedder,
             tokenizer_decode=tokenizer_decode,
             tmp_dir=tmp, checkpoint_path=ck,
+            tokenize_len=tokenize_len_bgem3,
         ))
     finally:
         loop.close()

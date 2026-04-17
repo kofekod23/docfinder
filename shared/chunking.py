@@ -12,6 +12,7 @@ from typing import Callable, List
 _BLANK_LINE_RE = re.compile(r"\n\s*\n+")
 _HEADING_MD_RE = re.compile(r"^#{1,6}\s+\S")
 _HEADING_NUM_RE = re.compile(r"^\d+\.\s+\S")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,47 @@ def is_heading(line: str) -> bool:
     return False
 
 
+def _explode_oversize(
+    paragraphs: List[str],
+    tokenize_len: Callable[[str], int],
+    hard_max: int,
+) -> List[str]:
+    """Split paragraphs exceeding hard_max into sentence-packed pieces."""
+    result: List[str] = []
+    for para in paragraphs:
+        if tokenize_len(para) <= hard_max:
+            result.append(para)
+            continue
+        sentences = _SENTENCE_SPLIT_RE.split(para)
+        buf: List[str] = []
+        buf_tok = 0
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            st = tokenize_len(s)
+            if st > hard_max:
+                if buf:
+                    result.append(" ".join(buf))
+                    buf, buf_tok = [], 0
+                # A single sentence exceeds hard_max: force-split by words so the
+                # embedder receives something shorter than its context window.
+                words = s.split()
+                step = max(1, len(words) * hard_max // max(1, st))
+                for i in range(0, len(words), step):
+                    result.append(" ".join(words[i:i + step]))
+                continue
+            if buf_tok + st > hard_max and buf:
+                result.append(" ".join(buf))
+                buf, buf_tok = [s], st
+            else:
+                buf.append(s)
+                buf_tok += st
+        if buf:
+            result.append(" ".join(buf))
+    return result
+
+
 def chunk_paragraphs(
     paragraphs: List[str],
     tokenize_len: Callable[[str], int],
@@ -52,6 +94,7 @@ def chunk_paragraphs(
     """Greedy accumulator with forced break on headings and 1-para overlap."""
     if not paragraphs:
         return []
+    paragraphs = _explode_oversize(paragraphs, tokenize_len, hard_max)
 
     chunks: List[Chunk] = []
     buf: List[str] = []
