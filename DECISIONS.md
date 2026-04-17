@@ -21,9 +21,10 @@
 ## D5 — Chunking dans Colab uniquement (pas au moment de la recherche)
 **Pourquoi :** Le serveur local ne dispose pas des documents. L'indexation batch (GPU Colab) est la seule source de vérité dans Qdrant.
 
-## D6 — Connexion Colab → Qdrant local via ngrok
-**Pourquoi :** Qdrant tourne en binaire natif sur la machine locale, inaccessible directement depuis Colab.  
-**Setup :** L'utilisateur lance `./ngrok http 6333` sur sa machine, colle l'URL HTTPS dans le notebook.
+## D6 — Connexion Colab → serveur FastAPI local via Cloudflare Tunnel
+**Pourquoi :** Qdrant et FastAPI tournent sur la machine locale, inaccessibles directement depuis Colab. Cloudflare Tunnel (cloudflared) expose uniquement FastAPI (port 8000) — Colab n'appelle jamais Qdrant directement, le serveur fait relais via `/admin/upsert`.  
+**Setup :** `./start.sh` lit `.env`, lance `cloudflared tunnel run --token …` en arrière-plan. L'URL publique (`DOCFINDER_PUBLIC_URL`, hostname configuré sur le dashboard Cloudflare) est **stable** entre les redémarrages.  
+**Historique :** Version initiale utilisait ngrok — remplacé par Cloudflare Tunnel le 2026-04-16 (voir D14). Le fallback ngrok est conservé dans `/admin/tunnels` pour rétrocompat.
 
 ## D7 — Chunking par paragraphes avec overlap
 **Pourquoi :** Préserve le contexte sémantique. Taille cible : 512 tokens (~400 mots), overlap 50 mots.  
@@ -53,3 +54,69 @@
 ## D13 — Forcer device="cpu" sur l'Embedder local (shared/embedder.py)
 **Pourquoi :** Sur Apple Silicon (M1/M2/M3), sentence-transformers tente d'utiliser le GPU Metal (MPS). MPS a des limitations avec certains opérateurs et consomme la mémoire partagée GPU, impactant les autres applis. Forcer `device="cpu"` garantit la stabilité et libère le GPU Metal pour d'autres usages.  
 **Décision :** `device="cpu"` hardcodé dans le singleton Embedder local. Colab utilise CUDA sans restriction.
+
+## D14 — Cloudflare Tunnel en remplacement de ngrok (2026-04-16)
+**Pourquoi :** ngrok gratuit a trop de frictions pour un usage répété depuis Colab :
+- URL random à chaque redémarrage → `NGROK_URL` à recopier dans le notebook à chaque session
+- Rate limit 40 req/min pénalise les batchs d'upsert
+- Page d'avertissement navigateur forçait un header `ngrok-skip-browser-warning`
+- Session qui expire après quelques heures d'inactivité
+- `ngrok start --all` (2 tunnels simultanés) nécessite un plan payant ou des reserved domains
+
+**Choix :** Cloudflare Tunnel (named tunnel, token dans `.env`) — gratuit, URL stable (hostname personnalisé), pas de rate limit, pas de page d'avertissement, un seul tunnel suffit (FastAPI relaie vers Qdrant).
+
+**Architecture de config :**
+- `.env` (gitignored) : `CLOUDFLARE_TUNNEL_TOKEN` + `DOCFINDER_PUBLIC_URL`
+- `start.sh` lit `.env`, lance `cloudflared tunnel run --token "$TOKEN"` en arrière-plan si le token existe
+- `/admin/tunnels` retourne `{"provider": "cloudflare"|"ngrok"|None, "healthy": bool, "tunnels": {…}}` — détecte cloudflared via `http://localhost:8081/ready` (métriques), fallback ngrok sur le port 4040
+
+**Sécurité :** Le token ne doit jamais apparaître en argv (visible dans `ps`). `start.sh` le lit via `source .env` puis passe `"$CLOUDFLARE_TUNNEL_TOKEN"` — c'est acceptable car `ps aux` sur macOS ne montre pas les env vars d'un autre user. Pour un durcissement supplémentaire, utiliser `cloudflared service install` qui stocke le token dans le keychain système.
+
+**Rétrocompat :** ngrok continue de fonctionner si `DOCFINDER_PUBLIC_URL` n'est pas défini.
+
+## D15 — Fiabilité & vitesse d'indexation Colab (2026-04-16)
+**Contexte :** Indexation lente sur Mac âgé + crashs réguliers + perte de progression à chaque redémarrage.
+
+**Diagnostic :**
+1. Le Mac calculait YAKE + sparse AVANT d'envoyer les chunks à Colab → le Mac était le goulot (YAKE est du pur Python, très coûteux).
+2. `fitz.open()` sans `with` → handles PDF et mémoire non libérés sur exception.
+3. `client.upsert(wait=False)` → Qdrant ACK avant persistence disque, possible perte silencieuse.
+4. `QdrantClient` recréé à chaque `/admin/upsert` → connexions HTTP qui s'empilent.
+5. `UPSERT_EVERY=512` côté Colab + reprise doc-level via `/admin/indexed-doc-ids` → si on flush 20 chunks sur 30 d'un doc puis crash, la reprise skippe le doc entier = chunks manquants (silent data loss).
+
+**Décisions :**
+
+**D15.a — YAKE + sparse vectors déportés sur Colab**
+- `server/chunks.py` n'émet plus YAKE/keywords/sparse — juste le texte brut des chunks
+- Colab calcule YAKE + sparse + MD5 (mêmes constantes que server/indexer.py : `lan="fr", n=3, dedupLim=0.7, top=20` + `hash % 2^20`)
+- Gain : le Mac n'a plus que l'I/O + extraction texte (pymupdf), le CPU est libéré
+- Avec une fibre 400/300, le surcoût bande passante (JSON plus verbeux) est négligeable vs le gain CPU Mac
+
+**D15.b — Flush atomique par document**
+- Le producteur NDJSON Colab pousse un marqueur `{"__end_of_doc__": doc_id}` à chaque frontière de doc
+- Le consommateur flush immédiatement les pending_points à ce marqueur
+- Garantit que `/admin/indexed-doc-ids` ne retourne jamais un doc partiellement indexé
+- Safety-net : `UPSERT_EVERY=64` pour les très gros docs (plus petit = moins à perdre)
+
+**D15.c — Checkpoint disque Colab avant chaque flush**
+- `pending_points` picklé dans `/content/docfinder_checkpoint.pkl` via écriture atomique (`os.replace`) AVANT le POST
+- Supprimé après ACK Mac
+- Si le kernel crashe entre checkpoint et ACK → au prochain run, `_load_checkpoint()` rejoue les points orphelins avant de reprendre le flux
+
+**D15.d — Retry exponentiel sur les upserts Colab → Mac**
+- 3 tentatives (2s, 4s, 8s) sur `/admin/upsert`
+- Robuste aux micro-coupures Cloudflare Tunnel, aux GC Qdrant, aux pauses réseau Colab
+
+**D15.e — `wait=True` sur les upserts Qdrant**
+- `upsert_points()` + indexation locale attendent l'ACK disque Qdrant
+- Coût perf ~5-10 % mais garantit "flush réussi côté Colab = données persistées"
+
+**D15.f — `with fitz.open()` + `gc.collect()` périodique**
+- Context manager sur tous les `fitz.open()` de `chunks.py` et `indexer.py`
+- `gc.collect()` tous les 10 fichiers (chunks.py) et 5 fichiers (indexer.py) — les embeddings numpy et PointStruct peuvent peser plusieurs centaines de MB
+
+**D15.g — `QdrantClient` au niveau module**
+- `indexer.py::_get_client()` — singleton lazy, pas de recréation par requête
+
+**D15.h — Batch GPU Colab 128 → 256**
+- T4 tient largement 256 avec `paraphrase-multilingual-mpnet-base-v2` → gain ~1,6×

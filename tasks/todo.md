@@ -29,6 +29,32 @@
 - [x] Commentaires enrichis — docstrings architecture dans tous les modules clés
 - [x] `DECISIONS.md` — D8 à D13 ajoutées
 
+## En cours — Pipeline Colab v2 (Task 18 Phase A)
+
+Code plumbing terminé côté Mac + Colab :
+- [x] `colab/query_server.py` — FastAPI `/encode` + `set_wrapper()` pour éviter double-chargement GPU
+- [x] `server/encode_client.py` — `RemoteEncoder` httpx (fail-fast, pas de fallback v1)
+- [x] `server/search.py` — routage local/remote via `COLAB_ENCODE_URL`
+- [x] `colab_helpers_cell.py` — uvicorn thread daemon + `asyncio.run(run_pipeline)` en main
+- [x] `.env.example` — 4 variables ajoutées
+
+Reste à faire (action utilisateur requise) :
+- [ ] Générer `COLAB_QUERY_TOKEN` et le poser côté Mac + Colab
+- [ ] Créer le 2ᵉ tunnel Cloudflare nommé → `http://localhost:8001`
+- [ ] Redémarrer uvicorn Mac
+- [ ] Smoke test `/healthz` + `/encode` + `/search`
+- [ ] Valider §15 (cross-lingual, keywords, mtime, latence p50 < 1.5s) sur 20 docs
+- [ ] Commit `chore(v2): dry-run 20 docs OK`
+
+Procédure détaillée : `tasks/setup-phase-a-query-tunnel.md`.
+
+## Dette sécurité (hors-scope, à traiter plus tard)
+
+- `.env.example` a été scrubbé (placeholders vides), mais les anciennes valeurs
+  (JWT tunnel CF + CF-Access-Client-Id/Secret) restent dans l'historique git.
+  À rotater dès que la Phase A sera validée : régénérer tunnel token + service
+  token CF Access, puis mettre à jour `.env` local et les secrets Colab.
+
 ## À faire (optionnel)
 
 - [ ] Tests unitaires (pytest) pour search.py et embedder.py
@@ -37,3 +63,14 @@
 - [ ] Pagination des résultats
 - [ ] Endpoint DELETE /document/{doc_id} pour supprimer de l'index
 - [ ] Support .odt et .rtf
+
+## À faire — Ré-indexation des fichiers modifiés
+
+Problème : le `doc_id = md5(chemin)` ne tient pas compte du contenu ni de la date de modification.
+Un fichier modifié depuis la dernière indexation est silencieusement skippé (ses anciens chunks restent dans Qdrant).
+
+Plan (3 fichiers) :
+- [x] `server/chunks.py` — ajouter `mtime = int(file_path.stat().st_mtime)` dans le payload de chaque chunk
+- [x] `server/admin_v2.py` — `/admin/indexed-state` retourne `{doc_id: mtime}` (implémenté dans admin_v2)
+- [x] `colab/pipeline.py` — compare `mtime` actuel vs Qdrant, ré-indexe si différent
+- [x] `server/admin_v2.py` — endpoint `DELETE /admin/doc/{doc_id}` (supprime tous les points d'un doc)

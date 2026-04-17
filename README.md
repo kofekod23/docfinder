@@ -10,7 +10,7 @@ Moteur de recherche hybride de documents personnels — dense + sparse avec rera
   (batch)          │  colab_indexer.ipynb                    │
                    │  PDF/Word/txt/md → chunks → embeddings  │
                    └──────────────────┬──────────────────────┘
-                                      │ REST via ngrok
+                                      │ REST via Cloudflare Tunnel
                                       ▼
                    ┌─────────────────────────────────────────┐
   Stockage         │  Qdrant local (port 6333)               │
@@ -33,7 +33,7 @@ Moteur de recherche hybride de documents personnels — dense + sparse avec rera
 
 - Python 3.10+
 - Qdrant binaire natif (voir ci-dessous)
-- ngrok (pour l'indexation depuis Colab uniquement)
+- cloudflared (pour l'indexation depuis Colab uniquement — voir §4)
 
 ---
 
@@ -84,16 +84,41 @@ python setup_qdrant.py --force
 
 ---
 
-## 4. Indexation des documents (Colab)
+## 4. Indexation des documents (Colab via Cloudflare Tunnel)
 
-1. Démarrez ngrok sur votre machine locale :
+Cloudflare Tunnel remplace ngrok : URL publique **stable** (pas à recopier à chaque session), pas de limite de débit, pas de page d'avertissement, gratuit.
+
+### Installer cloudflared
+
+```bash
+# macOS
+brew install cloudflared
+# Linux
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+chmod +x cloudflared
+```
+
+### Configurer le tunnel (une seule fois)
+
+1. Sur le dashboard Cloudflare → **Zero Trust** → **Networks** → **Tunnels** → *Create a tunnel* → *Cloudflared*.
+2. Notez le token affiché (format `eyJ…`).
+3. Ajoutez un **Public Hostname** qui pointe vers `http://localhost:8000` (service = HTTP, URL = `localhost:8000`). Ex. `docfinder.mondomaine.com`.
+4. Copiez `.env.example` → `.env` et renseignez :
    ```bash
-   ./ngrok http 6333
+   CLOUDFLARE_TUNNEL_TOKEN=eyJ…
+   DOCFINDER_PUBLIC_URL=https://docfinder.mondomaine.com
    ```
-2. Copiez l'URL HTTPS fournie par ngrok (ex. `https://abc123.ngrok-free.app`).
+   > ⚠ `.env` est **gitignored**. Ne commitez jamais le token.
+
+### Lancer l'indexation
+
+1. `./start.sh` (démarre Qdrant + cloudflared + uvicorn en une commande).
+2. Ouvrez `http://localhost:8000/admin` — la section *Tunnel* affiche l'URL publique + un indicateur 🟢 si cloudflared est actif.
 3. Ouvrez `colab_indexer.ipynb` dans Google Colab (**Runtime → T4 GPU**).
-4. Renseignez `NGROK_URL` et `DRIVE_DOCS_PATH` dans la cellule de configuration.
+4. Collez votre `DOCFINDER_URL` dans la cellule de configuration (une seule fois — elle ne change plus).
 5. Montez votre Google Drive et exécutez toutes les cellules.
+
+> **Fallback ngrok** : le code détecte encore `ngrok start --all` (API locale port 4040) si aucun `DOCFINDER_PUBLIC_URL` n'est défini.
 
 ---
 

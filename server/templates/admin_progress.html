@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DocFinder — Progression</title>
+  <style>
+    :root {
+      --bg:#0d1117;--surface:#161b22;--surface-2:#21262d;
+      --border:#30363d;--accent:#58a6ff;--accent-2:#79c0ff;
+      --text:#c9d1d9;--muted:#8b949e;--green:#3fb950;--red:#f85149;--r:8px;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+         font-size:15px;line-height:1.5;min-height:100vh;padding:2.5rem 1rem 4rem}
+    .wrap{max-width:860px;margin:0 auto}
+    .nav{display:flex;gap:1.5rem;margin-bottom:2.5rem;
+         border-bottom:1px solid var(--border);padding-bottom:1rem}
+    .nav a{color:var(--muted);text-decoration:none;font-size:.9rem;font-weight:500}
+    .nav a:hover{color:var(--text)}
+    .nav a.active{color:var(--accent)}
+    h1{font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:.3rem}
+    .subtitle{color:var(--muted);font-size:.875rem;margin-bottom:2rem}
+    .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+                gap:.75rem;margin-bottom:1.5rem}
+    .stat-card{background:var(--surface);border:1px solid var(--border);
+               border-radius:var(--r);padding:1rem 1.25rem}
+    .stat-label{font-size:.75rem;color:var(--muted);margin-bottom:.25rem}
+    .stat-value{font-size:1.75rem;font-weight:700;color:var(--accent)}
+    .stat-sub{font-size:.75rem;color:var(--muted);margin-top:.1rem}
+    .bar{height:8px;background:var(--surface-2);border-radius:4px;overflow:hidden;margin:1rem 0}
+    .bar-fill{height:100%;background:var(--green);transition:width .3s ease}
+    .current{background:var(--surface);border:1px solid var(--border);
+             border-radius:var(--r);padding:.85rem 1rem;font-family:ui-monospace,"SF Mono",monospace;
+             font-size:.8rem;color:var(--muted);word-break:break-all}
+    .idle{color:var(--muted);font-style:italic}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav class="nav">
+      <a href="/">Recherche</a>
+      <a href="/admin">Indexation</a>
+      <a href="/admin/progress-view" class="active">Progression</a>
+      <a href="/admin/db">Base</a>
+    </nav>
+
+    <h1>Progression indexation</h1>
+    <p class="subtitle">Rafraîchissement automatique toutes les 2 s — données poussées par les workers Colab.</p>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Traités / Total</div>
+        <div class="stat-value"><span id="done">–</span><span style="color:var(--muted);font-size:1rem">/<span id="total">–</span></span></div>
+        <div class="stat-sub"><span id="pct">0</span>%</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Échecs</div>
+        <div class="stat-value" id="failed">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Chunks / s</div>
+        <div class="stat-value" id="cps">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">ETA</div>
+        <div class="stat-value" id="eta">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">GPU %</div>
+        <div class="stat-value" id="gpu">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">VRAM Mo</div>
+        <div class="stat-value" id="vram">–</div>
+      </div>
+    </div>
+
+    <div class="bar"><div class="bar-fill" id="barFill" style="width:0%"></div></div>
+
+    <div class="stat-label" style="margin-bottom:.5rem">Document en cours</div>
+    <div class="current" id="current"><span class="idle">(en attente…)</span></div>
+  </div>
+
+  <script>
+    function fmtEta(s){
+      if(!s) return "–";
+      if(s<60) return s+"s";
+      const m=Math.floor(s/60), r=s%60;
+      if(m<60) return m+"m"+(r?" "+r+"s":"");
+      const h=Math.floor(m/60), rm=m%60;
+      return h+"h"+(rm?" "+rm+"m":"");
+    }
+    async function tick(){
+      try{
+        const r = await fetch("/admin/progress", {cache:"no-store"});
+        const d = await r.json();
+        const total = d.total||0, done = d.done||0;
+        const pct = total ? Math.round(100*done/total) : 0;
+        document.getElementById("done").textContent = done;
+        document.getElementById("total").textContent = total;
+        document.getElementById("pct").textContent = pct;
+        document.getElementById("failed").textContent = d.failed||0;
+        document.getElementById("cps").textContent = (d.chunks_per_sec||0).toFixed(1);
+        document.getElementById("eta").textContent = fmtEta(d.eta_seconds||0);
+        document.getElementById("gpu").textContent = (d.gpu_util_pct||0);
+        document.getElementById("vram").textContent = (d.vram_used_mb||0);
+        document.getElementById("barFill").style.width = pct + "%";
+        const cur = d.current_doc || "";
+        const el = document.getElementById("current");
+        el.innerHTML = cur ? cur : '<span class="idle">(en attente…)</span>';
+      }catch(e){
+        document.getElementById("current").innerHTML = '<span class="idle">(endpoint injoignable)</span>';
+      }
+    }
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>

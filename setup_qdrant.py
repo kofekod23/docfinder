@@ -5,7 +5,7 @@ Initialise la collection Qdrant pour DocFinder.
     python setup_qdrant.py
 
 Crée la collection "docfinder" avec :
-  - Vecteurs denses : 768 dims, distance cosine (paraphrase-multilingual-mpnet-base-v2)
+  - Vecteurs denses : 1024 dims, distance cosine (intfloat/multilingual-e5-large)
   - Vecteurs sparse : indices + valeurs YAKE (BM25 maison)
 """
 import sys
@@ -21,7 +21,7 @@ from qdrant_client.models import (
 # Configuration Qdrant local (binaire natif)
 QDRANT_URL = "http://localhost:6333"
 COLLECTION_NAME = "docfinder"
-DENSE_DIM = 768  # paraphrase-multilingual-mpnet-base-v2
+DENSE_DIM = 1024  # intfloat/multilingual-e5-large
 
 
 def setup_collection(force: bool = False) -> None:
@@ -72,7 +72,7 @@ def setup_collection(force: bool = False) -> None:
     )
 
     print(f"[OK] Collection '{COLLECTION_NAME}' créée avec succès.")
-    print(f"     - Vecteurs denses  : {DENSE_DIM} dims, distance cosine")
+    print(f"     - Vecteurs denses  : {DENSE_DIM} dims, cosine (multilingual-e5-large)")
     print(f"     - Vecteurs sparse  : YAKE/BM25, in-memory index")
     print(f"     - URL Qdrant       : {QDRANT_URL}")
 

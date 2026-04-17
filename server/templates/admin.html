@@ -224,6 +224,27 @@
     .res-section { font-size: .7rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: .9rem 0 .5rem; }
     .res-section:first-child { margin-top: 0; }
 
+    /* Colab activity badge */
+    .badge-active {
+      display: inline-flex;
+      align-items: center;
+      gap: .35rem;
+      padding: .2rem .6rem;
+      border-radius: 4px;
+      font-size: .72rem;
+      font-weight: 600;
+      background: rgba(88,166,255,.15);
+      border: 1px solid rgba(88,166,255,.35);
+      color: var(--accent);
+    }
+    .badge-active .dot-active {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 1s infinite;
+      flex-shrink: 0;
+    }
+
     /* Colab status */
     .colab-status {
       display: flex;
@@ -268,6 +289,11 @@
           value="{{ default_path }}"
           placeholder="/chemin/vers/documents"
         >
+        <div id="dirExcludeWrap" style="display:none;margin-bottom:1rem">
+          <label style="margin-bottom:.4rem;display:block">Exclure des sous-répertoires</label>
+          <div id="dirCheckboxes" style="display:flex;flex-wrap:wrap;gap:.5rem;padding:.75rem;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);max-height:200px;overflow-y:auto;"></div>
+        </div>
+        <input type="hidden" id="excludedDirsInput" name="excluded_dirs" value="[]">
         <div class="checkbox-row">
           <input type="checkbox" id="resetCheck" name="reset" value="true">
           <span>
@@ -289,6 +315,9 @@
           <div class="dot" id="colabDot" style="background:var(--muted)"></div>
           <span id="colabStatusText" style="font-size:.85rem;color:var(--muted)">Déconnecté</span>
           <span id="colabDeviceBadge" style="display:none" class="badge-device"></span>
+          <span id="colabActiveBadge" style="display:none" class="badge-active">
+            <span class="dot-active"></span>En indexation…
+          </span>
         </div>
         <div style="display:flex;gap:.5rem">
           <button id="pauseBtn" onclick="colabPause()" style="display:none;padding:.3rem .8rem;font-size:.75rem;font-weight:600;border-radius:4px;border:1px solid var(--yellow);background:rgba(210,153,34,.1);color:var(--yellow);cursor:pointer">⏸ Pause</button>
@@ -297,10 +326,10 @@
       </div>
 
       <p style="font-size:.85rem;color:var(--muted);margin-bottom:1rem">
-        Ouvrez le notebook sur Colab et collez ces URLs dans la cellule de configuration.
+        Ouvrez le notebook sur Colab et collez cette URL dans la cellule de configuration.
         Le notebook se déclenchera automatiquement dès que vous lancez une indexation.
       </p>
-      <div id="tunnelStatus" style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">Chargement des URLs ngrok…</div>
+      <div id="tunnelStatus" style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">Chargement du tunnel…</div>
       <div style="display:flex;flex-direction:column;gap:.6rem" id="tunnelRows"></div>
       <div style="margin-top:1rem">
         <a id="colabLink"
@@ -311,6 +340,45 @@
         </a>
       </div>
     </div>
+
+    <!-- server/templates/admin.html : v2 progress (hidden unless USE_V2) -->
+    <section id="v2-progress" data-use-v2="{{ use_v2 }}" hidden>
+      <h2>Indexation v2 (Colab)</h2>
+      <p><strong>Doc courant :</strong> <span id="v2-current-doc">—</span></p>
+      <progress id="v2-bar" max="1" value="0"></progress>
+      <p><span id="v2-done">0</span> / <span id="v2-total">0</span> docs
+         — <span id="v2-rate">0</span> chunks/s — ETA <span id="v2-eta">—</span></p>
+      <div class="bars">
+        <label>GPU</label>
+        <progress id="v2-gpu" max="100" value="0"></progress>
+        <label>VRAM</label>
+        <progress id="v2-vram" max="16384" value="0"></progress>
+      </div>
+    </section>
+
+    <script>
+    async function pollV2Progress() {
+      try {
+        const r = await fetch('/admin/progress');
+        const p = await r.json();
+        document.getElementById('v2-current-doc').textContent = p.current_doc || '—';
+        document.getElementById('v2-done').textContent = p.done;
+        document.getElementById('v2-total').textContent = p.total;
+        document.getElementById('v2-rate').textContent = (p.chunks_per_sec || 0).toFixed(1);
+        document.getElementById('v2-eta').textContent = p.eta_seconds + ' s';
+        const bar = document.getElementById('v2-bar');
+        bar.max = Math.max(1, p.total);
+        bar.value = p.done;
+        document.getElementById('v2-gpu').value = p.gpu_util_pct || 0;
+        document.getElementById('v2-vram').value = p.vram_used_mb || 0;
+      } catch (_) {}
+    }
+    if (document.getElementById('v2-progress').dataset.useV2 === 'true') {
+      document.getElementById('v2-progress').hidden = false;
+      setInterval(pollV2Progress, 5000);
+      pollV2Progress();
+    }
+    </script>
 
     <div class="card" id="statusCard">
       <div class="card-header">
@@ -417,11 +485,7 @@
       startBtn.disabled = (s === 'running');
       killBtn.disabled  = (s !== 'running');
 
-      // Arrêt du polling
-      if ((s === 'done' || s === 'error') && pollInterval) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-      }
+      // Polling permanent — ne jamais arrêter, pour détecter les jobs Colab suivants
     }
 
     function escHtml(s) {
@@ -452,20 +516,27 @@
       poll();
     });
 
-    // ── Tunnels ngrok ──────────────────────────────────────────────────────
+    // ── Tunnel (Cloudflare par défaut, ngrok en fallback) ──────────────────
     async function loadTunnels() {
       try {
         const r = await fetch('/admin/tunnels');
-        const tunnels = await r.json();
+        const data = await r.json();
+        const tunnels = data.tunnels || {};
+        const provider = data.provider;
+        const healthy  = data.healthy;
         const rows = document.getElementById('tunnelRows');
         const status = document.getElementById('tunnelStatus');
 
         if (!Object.keys(tunnels).length) {
-          status.textContent = 'ngrok non détecté — lancez : ngrok start --all';
+          status.textContent = 'Aucun tunnel détecté — définissez DOCFINDER_PUBLIC_URL dans .env, ou lancez cloudflared / ngrok.';
+          rows.innerHTML = '';
           return;
         }
 
-        status.textContent = 'URLs actives (à coller dans le notebook Colab) :';
+        const providerLabel = provider === 'cloudflare' ? 'Cloudflare Tunnel' : (provider === 'ngrok' ? 'ngrok (fallback)' : 'Tunnel');
+        const healthIcon = healthy ? '🟢' : '🟡';
+        const healthTxt  = healthy ? 'actif' : 'URL configurée (santé non vérifiée)';
+        status.innerHTML = `${healthIcon} <strong>${providerLabel}</strong> — ${healthTxt}. URL à coller dans le notebook Colab :`;
         rows.innerHTML = '';
 
         const labels = { qdrant: 'Qdrant (port 6333)', docfinder: 'DocFinder (port 8000)' };
@@ -550,11 +621,12 @@
     refreshResources();
 
     // ── Colab status ────────────────────────────────────────────────────────
-    const colabDot    = document.getElementById('colabDot');
-    const colabTxt    = document.getElementById('colabStatusText');
-    const colabBadge  = document.getElementById('colabDeviceBadge');
-    const pauseBtn    = document.getElementById('pauseBtn');
-    const resumeBtn   = document.getElementById('resumeBtn');
+    const colabDot        = document.getElementById('colabDot');
+    const colabTxt        = document.getElementById('colabStatusText');
+    const colabBadge      = document.getElementById('colabDeviceBadge');
+    const colabActiveBadge= document.getElementById('colabActiveBadge');
+    const pauseBtn        = document.getElementById('pauseBtn');
+    const resumeBtn       = document.getElementById('resumeBtn');
 
     async function refreshColabStatus() {
       try {
@@ -576,6 +648,8 @@
             colabBadge.textContent = 'CPU';
           }
 
+          colabActiveBadge.style.display = s.active ? 'inline-flex' : 'none';
+
           if (s.paused) {
             pauseBtn.style.display  = 'none';
             resumeBtn.style.display = 'inline-block';
@@ -588,9 +662,10 @@
           colabDot.style.animation  = 'none';
           colabTxt.style.color      = 'var(--muted)';
           colabTxt.textContent      = 'Déconnecté';
-          colabBadge.style.display  = 'none';
-          pauseBtn.style.display    = 'none';
-          resumeBtn.style.display   = 'none';
+          colabBadge.style.display       = 'none';
+          colabActiveBadge.style.display = 'none';
+          pauseBtn.style.display         = 'none';
+          resumeBtn.style.display        = 'none';
         }
       } catch(e) { /* réseau */ }
     }
@@ -614,13 +689,46 @@
 
     loadTunnels();
 
-    // Si un job tourne déjà au chargement de la page, on poll
-    (function() {
-      const initialStatus = '{{ job.status }}';
-      if (initialStatus === 'running') {
-        pollInterval = setInterval(poll, 1500);
-      }
-    })();
+    // Polling permanent — couvre les jobs locaux ET les jobs déclenchés par Colab
+    pollInterval = setInterval(poll, 1500);
+    poll();
+
+    // ── Exclusion de sous-répertoires ──────────────────────────────────────
+    const dirExcludeWrap   = document.getElementById('dirExcludeWrap');
+    const dirCheckboxes    = document.getElementById('dirCheckboxes');
+    const excludedDirsInput = document.getElementById('excludedDirsInput');
+    const pathInput        = document.getElementById('pathInput');
+
+    async function loadDirs(path) {
+      try {
+        const r = await fetch('/admin/dirs?path=' + encodeURIComponent(path));
+        const { dirs } = await r.json();
+        dirCheckboxes.innerHTML = '';
+        if (!dirs || !dirs.length) { dirExcludeWrap.style.display = 'none'; return; }
+        dirExcludeWrap.style.display = 'block';
+        dirs.forEach(dir => {
+          const label = document.createElement('label');
+          label.style.cssText = 'display:inline-flex;align-items:center;gap:.35rem;cursor:pointer;font-size:.8rem;color:var(--text);padding:.25rem .5rem;background:var(--surface);border:1px solid var(--border);border-radius:4px;';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox'; cb.value = dir; cb.checked = true;
+          cb.style.accentColor = 'var(--accent)';
+          cb.addEventListener('change', updateExcluded);
+          label.appendChild(cb);
+          label.appendChild(document.createTextNode(dir));
+          dirCheckboxes.appendChild(label);
+        });
+        updateExcluded();
+      } catch(e) { dirExcludeWrap.style.display = 'none'; }
+    }
+
+    function updateExcluded() {
+      const excluded = [...dirCheckboxes.querySelectorAll('input[type=checkbox]')]
+        .filter(cb => !cb.checked).map(cb => cb.value);
+      excludedDirsInput.value = JSON.stringify(excluded);
+    }
+
+    pathInput.addEventListener('blur', () => loadDirs(pathInput.value));
+    loadDirs(pathInput.value);
   </script>
 </body>
 </html>

@@ -1,0 +1,40 @@
+# Secrets — ne JAMAIS commiter
+.env
+.env.local
+*.env
+cloudflared.yml
+*.pem
+*.key
+
+# Données Qdrant locales
+/qdrant
+qdrant/
+qdrant_storage/
+qdrant_config.yaml
+snapshots/
+storage/
+.qdrant-initialized
+
+# Artefacts locaux
+tmp/
+graphify-out/
+*.bak
+
+# Environnement Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+.env

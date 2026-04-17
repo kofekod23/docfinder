@@ -12,7 +12,7 @@ Responsabilités :
 - Scanner un répertoire récursivement (PDF, DOCX, TXT, MD)
 - Extraire le texte brut (pymupdf pour PDF, python-docx pour DOCX)
 - Découper en chunks de 1500 chars avec overlap 200
-- Générer les vecteurs dense 768-dim (paraphrase-multilingual-mpnet-base-v2) et sparse (YAKE+MD5)
+- Générer les vecteurs dense 1024-dim (intfloat/multilingual-e5-large) et sparse (YAKE+MD5)
 - Insérer dans Qdrant par batches de 32 points (upsert idempotent)
 - Exposer l'état du job (progression, logs, statut) via current_job()
 
@@ -24,6 +24,7 @@ Différence avec les modules voisins :
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -47,6 +48,42 @@ CHUNK_OVERLAP = 200
 BATCH_SIZE = 32
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
 ICLOUD_DEFAULT = str(Path.home() / "Library/Mobile Documents/com~apple~CloudDocs")
+
+# Fichier de persistance : si présent au démarrage du serveur → reprendre le job
+_RESUME_FILE = Path(__file__).parent.parent / "storage" / "job_resume.json"
+
+
+def _save_resume(path: str) -> None:
+    """Persiste le chemin du job en cours pour reprise automatique au redémarrage."""
+    try:
+        _RESUME_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _RESUME_FILE.write_text(json.dumps({"path": path}))
+    except OSError:
+        log.warning("Impossible d'écrire %s", _RESUME_FILE)
+
+
+def _clear_resume() -> None:
+    """Supprime le fichier de reprise (job terminé normalement ou annulé)."""
+    try:
+        _RESUME_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def resume_if_needed() -> None:
+    """À appeler au démarrage du serveur : relance le job si crash précédent."""
+    if not _RESUME_FILE.exists():
+        return
+    try:
+        data = json.loads(_RESUME_FILE.read_text())
+        path = data.get("path", "")
+        if path:
+            log.info("[resume] Job interrompu détecté — reprise : %s", path)
+            start_indexation(path=path, reset=False)
+    except Exception:
+        log.warning("[resume] Fichier de reprise illisible, ignoré.", exc_info=True)
+        _clear_resume()
+
 
 _yake_extractor = yake.KeywordExtractor(lan="fr", n=3, dedupLim=0.7, top=20)
 
@@ -96,8 +133,40 @@ def current_job() -> dict:
         return _job.to_dict()
 
 
+def _upsert_with_retry(
+    client: QdrantClient,
+    points: list[PointStruct],
+    max_retries: int = 3,
+) -> None:
+    """Upsert un batch dans Qdrant avec retry exponentiel (1s → 2s → 4s).
+
+    Qdrant peut échouer ponctuellement sur un batch (overload, GC pause).
+    3 tentatives couvrent les transitoires sans masquer les pannes durables.
+    """
+    import time as _time
+
+    delay = 1.0
+    for attempt in range(1, max_retries + 2):
+        try:
+            client.upsert(collection_name=COLLECTION, points=points, wait=False)
+            return
+        except Exception as e:
+            if attempt > max_retries:
+                raise
+            log.warning(
+                "upsert Qdrant échoué (tentative %d/%d) : %s — retry dans %.0fs",
+                attempt, max_retries, e, delay,
+            )
+            _time.sleep(delay)
+            delay *= 2
+
+
 def upsert_points(points_data: list[dict]) -> int:
-    """Insère des points (envoyés par Colab) dans Qdrant local."""
+    """Insère des points (envoyés par Colab) dans Qdrant local.
+
+    Met aussi à jour le job courant (done, chunks, current_file) pour que
+    l'UI admin reflète la progression Colab en temps réel.
+    """
     client = QdrantClient(url=QDRANT_URL)
     structs: list[PointStruct] = []
     for p in points_data:
@@ -113,8 +182,105 @@ def upsert_points(points_data: list[dict]) -> int:
             payload=p["payload"],
         ))
     for i in range(0, len(structs), BATCH_SIZE):
-        client.upsert(collection_name=COLLECTION, points=structs[i : i + BATCH_SIZE], wait=False)
+        _upsert_with_retry(client, structs[i : i + BATCH_SIZE])
+
+    # Mise à jour du job pour l'UI
+    # Un batch Colab = tous les chunks d'UN fichier (chunk_index 0 = début de fichier)
+    if points_data:
+        new_files = sum(
+            1 for p in points_data if p.get("payload", {}).get("chunk_index", 1) == 0
+        )
+        last_path = points_data[-1].get("payload", {}).get("path", "")
+        with _lock:
+            _job.chunks += len(structs)
+            _job.done += new_files
+            if last_path:
+                _job.current_file = last_path
+
     return len(structs)
+
+
+def colab_file_skipped(count: int) -> None:
+    """Appelé quand Colab signale des fichiers déjà indexés (skip).
+
+    Met à jour _job.done et _job.skipped pour que l'UI reflète la vraie progression.
+    """
+    with _lock:
+        if _job.status == JobStatus.RUNNING:
+            _job.done += count
+            _job.skipped += count
+
+
+def load_indexed_hashes() -> dict[str, str]:
+    """Retourne {doc_id: file_hash} pour les documents **complètement** indexés dans Qdrant.
+
+    Un document est considéré complet seulement si le nombre de chunks présents en base
+    est >= total_chunks stocké dans le payload. Cela évite de skipper des fichiers
+    partiellement indexés après un crash.
+
+    Utilisé par chunks.py pour ignorer les fichiers inchangés lors d'une ré-indexation.
+    file_hash = "<mtime>_<size>" — pas de lecture du contenu, juste stat().
+    """
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        # doc_id → {"file_hash": str, "total_chunks": int, "count": int}
+        docs: dict[str, dict] = {}
+        offset = None
+        while True:
+            records, next_offset = client.scroll(
+                collection_name=COLLECTION,
+                with_payload=["doc_id", "file_hash", "total_chunks"],
+                with_vectors=False,
+                limit=1000,
+                offset=offset,
+            )
+            if not records:
+                break
+            for pt in records:
+                payload = pt.payload or {}
+                doc_id = payload.get("doc_id", "")
+                fhash = payload.get("file_hash", "")
+                total = payload.get("total_chunks", 0)
+                if not doc_id or not fhash:
+                    continue
+                if doc_id not in docs:
+                    docs[doc_id] = {"file_hash": fhash, "total_chunks": total, "count": 0}
+                docs[doc_id]["count"] += 1
+            if next_offset is None:
+                break
+            offset = next_offset
+        # N'inclure que les docs dont tous les chunks sont présents
+        return {
+            doc_id: info["file_hash"]
+            for doc_id, info in docs.items()
+            if info["total_chunks"] > 0 and info["count"] >= info["total_chunks"]
+        }
+    except Exception:
+        return {}
+
+
+def colab_job_start(path: str, total: int) -> None:
+    """Appelé par /chunks quand Colab démarre une indexation.
+
+    Si aucun job local n'est en cours, bascule _job en RUNNING pour que l'UI
+    reflète la progression Colab. N'interfère pas avec un job local actif.
+    """
+    with _lock:
+        if _job.status == JobStatus.RUNNING:
+            # Job local actif : juste mettre à jour le total si même chemin
+            if _job.path == path:
+                _job.total = total
+            return
+        # Pas de job local — on réinitialise les champs en place (pas de réassignation)
+        _job.status = JobStatus.RUNNING
+        _job.path = path
+        _job.total = total
+        _job.done = 0
+        _job.chunks = 0
+        _job.current_file = ""
+        _job.error = ""
+        _job.log_lines = [f"Indexation Colab démarrée : {path}"]
+    _save_resume(path)
 
 
 def start_indexation(path: str, reset: bool = False) -> dict:
@@ -125,6 +291,7 @@ def start_indexation(path: str, reset: bool = False) -> dict:
             return {"error": "Une indexation est déjà en cours."}
         _job = IndexJob(status=JobStatus.RUNNING, path=path)
     _cancel_event.clear()
+    _save_resume(path)
 
     t = threading.Thread(target=_run, args=(path, reset), daemon=True)
     t.start()
@@ -132,11 +299,17 @@ def start_indexation(path: str, reset: bool = False) -> dict:
 
 
 def cancel_indexation() -> dict:
-    """Demande l'annulation du job en cours."""
+    """Annule le job en cours — immédiatement pour les jobs Colab, via event pour les jobs locaux."""
     with _lock:
         if _job.status != JobStatus.RUNNING:
             return {"error": "Aucune indexation en cours."}
+        # Force la transition immédiate : couvre les jobs Colab (pas de thread local)
+        # et les jobs locaux (le thread verra aussi _cancel_event et confirme l'erreur).
+        _job.status = JobStatus.ERROR
+        _job.error = "Annulé par l'utilisateur."
+        _job.current_file = ""
     _cancel_event.set()
+    _clear_resume()
     return {"cancelled": True}
 
 
@@ -206,21 +379,85 @@ def _extract_text(path: Path) -> str:
     return ""
 
 
-def _chunk(text: str) -> list[str]:
-    """Découpe le texte en chunks de CHUNK_SIZE chars avec un overlap de CHUNK_OVERLAP.
+def _split_sentences(text: str) -> list[str]:
+    """Découpe un texte en phrases sur les ponctuations finales."""
+    parts = re.split(r"(?<=[.!?»])\s+", text.strip())
+    return [p for p in parts if p.strip()]
 
-    - Normalise les espaces (\\n, \\t → espace simple) avant le découpage.
-    - Overlap de 200 chars pour préserver le contexte inter-chunks (D7).
-    - Taille cible 1500 chars ≈ 300 mots ≈ fenêtre confortable pour 512 tokens.
+
+def _chunk(text: str) -> list[str]:
+    """Découpage hybride : paragraphes → phrases → overlap sémantique.
+
+    Synchronisé avec server/chunks.py — toute modification doit être répercutée.
     """
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
-    result, start = [], 0
-    while start < len(text):
-        result.append(text[start: start + CHUNK_SIZE])
-        start += CHUNK_SIZE - CHUNK_OVERLAP
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+    raw: list[str] = []
+    current = ""
+
+    for para in paragraphs:
+        if len(para) > CHUNK_SIZE:
+            if current:
+                raw.append(current)
+                current = ""
+            buf = ""
+            for sent in _split_sentences(para):
+                if len(buf) + len(sent) + 1 <= CHUNK_SIZE:
+                    buf = (buf + " " + sent).strip() if buf else sent
+                else:
+                    if buf:
+                        raw.append(buf)
+                    buf = sent
+            if buf:
+                raw.append(buf)
+        elif len(current) + len(para) + 2 <= CHUNK_SIZE:
+            current = (current + "\n\n" + para).strip() if current else para
+        else:
+            if current:
+                raw.append(current)
+            current = para
+
+    if current:
+        raw.append(current)
+
+    if not raw:
+        return []
+
+    result: list[str] = [raw[0]]
+    for i in range(1, len(raw)):
+        tail = raw[i - 1][-CHUNK_OVERLAP:]
+        m = re.search(r"(?<=[\.\!\?»])\s+\S", tail)
+        if m:
+            tail = tail[m.start():].strip()
+        elif len(tail) > CHUNK_OVERLAP // 2:
+            sp = tail.find(" ")
+            tail = tail[sp + 1:].strip() if sp != -1 else ""
+        else:
+            tail = ""
+        result.append((tail + " " + raw[i]).strip() if tail else raw[i])
+
     return result
+
+
+def _name_hint(file_path: Path) -> str:
+    """Construit un texte lisible à partir du nom et du chemin du fichier.
+
+    Remplace les séparateurs (_-) par des espaces pour que YAKE et le modèle
+    d'embedding voient des mots normaux plutôt que des tokens collés.
+    Ex : "Contrat_Loyer-2024" → "Contrat Loyer 2024"
+
+    Ce hint est préfixé au contenu textuel de chaque fichier pour que le nom
+    influence l'embedding dense et les keywords YAKE sparse, même quand le
+    texte principal est pauvre ou absent (PDF scanné, fichier chiffré).
+    """
+    parts = list(file_path.parts)
+    cleaned = [re.sub(r"[_\-]+", " ", p) for p in parts]
+    return " ".join(cleaned)
 
 
 def _iter_files(root: Path):
@@ -280,6 +517,7 @@ def _run(path: str, reset: bool) -> None:
                     _job.status = JobStatus.ERROR
                     _job.error = "Annulée par l'utilisateur."
                     _job.current_file = ""
+                _clear_resume()
                 return
 
             rel = str(file_path.relative_to(root))
@@ -287,11 +525,15 @@ def _run(path: str, reset: bool) -> None:
                 _job.current_file = rel
 
             text = _extract_text(file_path)
+            hint = _name_hint(file_path)
             if not text.strip():
-                # Texte vide (PDF scanné, fichier chiffré…) → chemin complet comme contenu
-                parts = [p.replace("_", " ").replace("-", " ") for p in file_path.parts]
-                text = " ".join(parts)
+                # Texte vide (PDF scanné, fichier chiffré…) → chemin comme contenu
+                text = hint
                 _log(f"  {rel} → texte vide, chemin utilisé comme contenu")
+            else:
+                # Préfixe le nom pour que YAKE et l'embedding voient toujours les
+                # mots-clés du fichier, même quand le texte principal est générique.
+                text = hint + "\n" + text
 
             chunks = _chunk(text)
             _log(f"  {rel} → {len(chunks)} chunks")
@@ -303,6 +545,11 @@ def _run(path: str, reset: bool) -> None:
                 "docx" if suffix in {".docx", ".doc"} else
                 "txt"  if suffix == ".txt"           else "md"
             )
+            try:
+                st = file_path.stat()
+                file_hash = f"{st.st_mtime:.3f}_{st.st_size}"
+            except OSError:
+                file_hash = ""
 
             embeddings = embedder.encode_batch(chunks, batch_size=BATCH_SIZE)
             points: list[PointStruct] = []
@@ -325,11 +572,12 @@ def _run(path: str, reset: bool) -> None:
                         "abs_path": str(file_path),
                         "doc_type": doc_type, "content": chunk_text,
                         "keywords": keywords, "chunk_index": idx,
+                        "file_hash": file_hash,
                     },
                 ))
 
             for i in range(0, len(points), BATCH_SIZE):
-                client.upsert(collection_name=COLLECTION, points=points[i: i + BATCH_SIZE])
+                _upsert_with_retry(client, points[i: i + BATCH_SIZE])
 
             with _lock:
                 _job.chunks += len(points)
@@ -337,11 +585,15 @@ def _run(path: str, reset: bool) -> None:
 
         _log(f"Terminé — {_job.chunks} chunks insérés, {_job.skipped} fichiers ignorés.")
         with _lock:
-            _job.status = JobStatus.DONE
-            _job.current_file = ""
+            # Ne pas écraser un ERROR forcé par cancel_indexation()
+            if _job.status == JobStatus.RUNNING:
+                _job.status = JobStatus.DONE
+                _job.current_file = ""
+        _clear_resume()
 
     except Exception as e:
         log.exception("Erreur indexation")
         with _lock:
             _job.status = JobStatus.ERROR
             _job.error = str(e)
+        # Pas de _clear_resume() ici : le fichier reste pour permettre la reprise au redémarrage

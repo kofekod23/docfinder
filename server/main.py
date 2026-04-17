@@ -11,6 +11,8 @@ Démarrage :
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -25,10 +27,13 @@ from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, current_job, start_indexation, upsert_points
+from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, colab_file_skipped, current_job, resume_if_needed, start_indexation, upsert_points
 from server.chunks import iter_chunks_json
-from server.search import SearchEngine
-from shared.schema import SearchResult
+from server.files_api import router as files_router
+from server.admin_v2 import router as admin_v2_router, set_qdrant_client
+from server.search import SearchEngine, search_v2
+from scripts.setup_qdrant_v2 import ensure_collection
+from shared.schema import SearchResult, SearchQuery
 
 # Répertoire des templates Jinja2
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -36,14 +41,19 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 # Instance globale du moteur (initialisée dans lifespan)
 _engine: SearchEngine | None = None
 
-# État Colab — mis à jour par heartbeat
+# État Colab — mis à jour par heartbeat et upserts
 _colab_state: dict = {
     "connected": False,
-    "device": None,        # "cuda" | "cpu" | None
-    "last_seen": 0.0,      # timestamp UNIX du dernier heartbeat
-    "paused": False,       # flag pause demandée par l'UI
+    "device": None,           # "cuda" | "cpu" | None
+    "last_seen": 0.0,         # timestamp UNIX du dernier heartbeat
+    "paused": False,          # flag pause demandée par l'UI
+    "last_activity": 0.0,     # timestamp du dernier /admin/upsert reçu
 }
-COLAB_TIMEOUT = 15.0       # secondes sans heartbeat = déconnecté
+COLAB_TIMEOUT = 30.0          # secondes sans heartbeat = déconnecté (marge tunnel CF)
+COLAB_ACTIVE_TIMEOUT = 30.0   # secondes sans upsert = inactif (entre deux batchs)
+
+# Sous-répertoires à exclure de l'indexation courante (mis à jour par POST /admin/index)
+_current_job_excluded: list[str] = []
 
 
 @asynccontextmanager
@@ -56,13 +66,18 @@ async def lifespan(app: FastAPI):
     global _engine
     print("[DocFinder] Démarrage — chargement du moteur de recherche…")
     _engine = SearchEngine()
+    ensure_collection(_engine.client, name="docfinder_v2")
+    set_qdrant_client(_engine.client, collection="docfinder_v2")
     print("[DocFinder] Prêt sur http://localhost:8000")
+    resume_if_needed()
     yield
     print("[DocFinder] Arrêt du serveur.")
 
 
 app = FastAPI(title="DocFinder — Recherche hybride de documents", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+app.include_router(files_router)
+app.include_router(admin_v2_router)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -79,37 +94,58 @@ async def index(request: Request) -> HTMLResponse:
     )
 
 
-@app.post("/search", response_class=HTMLResponse)
-async def search(
-    request: Request,
-    query: str = Form(...),
-    limit: int = Form(default=10),
-) -> HTMLResponse:
+def _engine_search(body: SearchQuery) -> List[SearchResult]:
     """
-    Exécute une recherche hybride et renvoie la page de résultats.
+    V1 search path: uses the default embedder and searches docfinder collection.
 
-    La vectorisation de la requête se fait localement (CPU).
-    Aucun appel externe n'est effectué.
+    Args:
+        body: SearchQuery with query and limit.
+
+    Returns:
+        List of SearchResult objects.
     """
-    results: List[SearchResult] = []
-    error: str | None = None
+    query = body.query.strip()
+    limit = max(1, min(body.limit, 50))
+    if not query:
+        return []
+    return _engine.search(query=query, limit=limit)
 
-    query = query.strip()
-    if query:
-        try:
-            results = _engine.search(query=query, limit=max(1, min(limit, 50)))
-        except Exception as exc:
-            error = f"Erreur lors de la recherche : {exc}"
 
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "results": results,
-            "query": query,
-            "error": error,
-        },
-    )
+@app.post("/search", response_class=JSONResponse)
+async def search(body: SearchQuery) -> JSONResponse:
+    """
+    Exécute une recherche hybride et retourne les résultats en JSON.
+
+    Route vers v2 si USE_V2=true, sinon vers v1 (default).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Check USE_V2 flag at request time
+        if os.environ.get("USE_V2", "false").lower() == "true":
+            # Route to v2
+            results = await loop.run_in_executor(
+                None,
+                lambda: search_v2(
+                    _engine.qdrant,
+                    _engine.embedder_v2,
+                    body.query,
+                    collection="docfinder_v2",
+                    limit=body.limit,
+                ),
+            )
+        else:
+            # Route to v1
+            results = await loop.run_in_executor(None, lambda: _engine_search(body))
+
+        return JSONResponse(
+            {"status": "ok", "results": [r.model_dump() for r in results]}
+        )
+    except Exception as exc:
+        return JSONResponse(
+            {"status": "error", "message": str(exc)},
+            status_code=500,
+        )
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -117,16 +153,40 @@ async def admin(request: Request) -> HTMLResponse:
     """Page d'administration — lancer une indexation."""
     return templates.TemplateResponse(
         "admin.html",
-        {"request": request, "default_path": ICLOUD_DEFAULT, "job": current_job()},
+        {
+            "request": request,
+            "default_path": ICLOUD_DEFAULT,
+            "job": current_job(),
+            "use_v2": os.environ.get("USE_V2", "false") == "true",
+        },
     )
+
+
+@app.get("/admin/dirs")
+async def admin_dirs(path: str = Query(default=ICLOUD_DEFAULT)) -> JSONResponse:
+    """Retourne la liste des sous-répertoires immédiats non-cachés du chemin donné."""
+    p = Path(path).expanduser()
+    if not p.exists() or not p.is_dir():
+        return JSONResponse({"dirs": []})
+    dirs = sorted(
+        d.name for d in p.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    )
+    return JSONResponse({"dirs": dirs})
 
 
 @app.post("/admin/index")
 async def admin_index(
     path: str = Form(default=ICLOUD_DEFAULT),
     reset: bool = Form(default=False),
+    excluded_dirs: str = Form(default="[]"),
 ) -> JSONResponse:
     """Lance une indexation en arrière-plan."""
+    global _current_job_excluded
+    try:
+        _current_job_excluded = json.loads(excluded_dirs)
+    except Exception:
+        _current_job_excluded = []
     result = start_indexation(path=path.strip(), reset=reset)
     return JSONResponse(result)
 
@@ -149,6 +209,7 @@ async def admin_ping() -> JSONResponse:
     job = current_job()
     return JSONResponse({
         "status": job["status"],
+        "path": job["path"],
         "done": job["done"],
         "total": job["total"],
         "chunks": job["chunks"],
@@ -188,10 +249,21 @@ async def admin_indexed_doc_ids() -> JSONResponse:
         return JSONResponse({"doc_ids": [], "error": str(exc)})
 
 
+@app.get("/admin/progress-view", response_class=HTMLResponse)
+async def admin_progress_view(request: Request) -> HTMLResponse:
+    """Page de suivi live — poll /admin/progress toutes les 2 s."""
+    return templates.TemplateResponse("admin_progress.html", {"request": request})
+
+
 @app.get("/admin/db", response_class=HTMLResponse)
-async def admin_db(request: Request) -> HTMLResponse:
-    """Page d'état de la base Qdrant — liste des documents indexés."""
-    stats: dict = {"total_chunks": 0, "total_docs": 0, "by_type": {}, "docs": []}
+async def admin_db(request: Request, v: int = 2) -> HTMLResponse:
+    """Page d'état de la base Qdrant — liste des documents indexés.
+
+    ?v=1 → collection docfinder (legacy)
+    ?v=2 → collection docfinder_v2 (pipeline Colab, défaut)
+    """
+    collection = "docfinder_v2" if v == 2 else COLLECTION
+    stats: dict = {"total_chunks": 0, "total_docs": 0, "by_type": {}, "docs": [], "collection": collection, "version": v}
     try:
         client = QdrantClient(url=QDRANT_URL)
         docs: dict[str, dict] = {}
@@ -199,7 +271,7 @@ async def admin_db(request: Request) -> HTMLResponse:
         offset = None
         while True:
             results, next_offset = client.scroll(
-                collection_name=COLLECTION,
+                collection_name=collection,
                 with_payload=["doc_id", "title", "path", "doc_type"],
                 with_vectors=False,
                 limit=500,
@@ -247,7 +319,7 @@ async def chunks(
     puis écrit directement dans Qdrant via ngrok.
     """
     return StreamingResponse(
-        iter_chunks_json(path),
+        iter_chunks_json(path, exclude=_current_job_excluded or None),
         media_type="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
@@ -269,6 +341,7 @@ async def admin_upsert(request: Request) -> JSONResponse:
         points_data = await request.json()
         loop = asyncio.get_event_loop()
         n = await loop.run_in_executor(None, upsert_points, points_data)
+        _colab_state["last_activity"] = time.time()
         return JSONResponse({"inserted": n})
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -367,17 +440,48 @@ async def doc_preview(path: str = Query(...)) -> Response:
 
 @app.get("/admin/tunnels")
 async def admin_tunnels() -> JSONResponse:
-    """Retourne les URLs ngrok actives (qdrant + docfinder)."""
+    """
+    Retourne les URLs du tunnel exposant ce serveur à Colab.
+
+    Ordre de priorité :
+      1. Cloudflare Tunnel — URL publique stable définie dans .env
+         (DOCFINDER_PUBLIC_URL). Santé vérifiée via les métriques locales
+         de cloudflared si disponibles (port 8081 par défaut).
+      2. Fallback ngrok — API locale sur le port 4040 (rétrocompat).
+
+    La réponse expose un dict {name: url} pour l'UI admin.
+    """
+    # ── 1. Cloudflare Tunnel ────────────────────────────────────────────────
+    cf_url = os.getenv("DOCFINDER_PUBLIC_URL", "").strip()
+    if cf_url:
+        provider = "cloudflare"
+        healthy = False
+        try:
+            # cloudflared expose /ready sur son port de métriques (défaut 8081)
+            async with httpx.AsyncClient() as client:
+                r = await client.get("http://localhost:8081/ready", timeout=2)
+                healthy = r.status_code == 200
+        except Exception:
+            healthy = False  # cloudflared pas lancé ou métriques désactivées
+        return JSONResponse({
+            "provider": provider,
+            "healthy": healthy,
+            "tunnels": {"docfinder": cf_url},
+        })
+
+    # ── 2. Fallback ngrok ───────────────────────────────────────────────────
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get("http://localhost:4040/api/tunnels", timeout=3)
-            tunnels = r.json().get("tunnels", [])
-        result = {}
-        for t in tunnels:
-            result[t["name"]] = t["public_url"]
-        return JSONResponse(result)
+            ngrok_tunnels = r.json().get("tunnels", [])
+        result = {t["name"]: t["public_url"] for t in ngrok_tunnels}
+        return JSONResponse({
+            "provider": "ngrok" if result else None,
+            "healthy": bool(result),
+            "tunnels": result,
+        })
     except Exception:
-        return JSONResponse({})
+        return JSONResponse({"provider": None, "healthy": False, "tunnels": {}})
 
 
 @app.get("/admin/resources")
@@ -447,6 +551,21 @@ async def colab_control() -> JSONResponse:
     return JSONResponse({"paused": _colab_state["paused"]})
 
 
+@app.post("/admin/colab/skip")
+async def colab_skip(request: Request) -> JSONResponse:
+    """Reçoit le nombre de fichiers ignorés par Colab (déjà indexés).
+
+    Colab appelle cet endpoint par batches pour signaler les fichiers skippés,
+    afin que l'UI admin reflète la vraie progression même quand tout est déjà indexé.
+    """
+    body = await request.json()
+    count = int(body.get("count", 0))
+    if count > 0:
+        colab_file_skipped(count)
+        _colab_state["last_activity"] = time.time()
+    return JSONResponse({"ok": True})
+
+
 @app.post("/admin/colab/pause")
 async def colab_pause() -> JSONResponse:
     """Met Colab en pause."""
@@ -464,11 +583,14 @@ async def colab_resume() -> JSONResponse:
 @app.get("/admin/colab/status")
 async def colab_status() -> JSONResponse:
     """Retourne l'état Colab pour l'UI (connecté, device, paused)."""
-    connected = (time.time() - _colab_state["last_seen"]) < COLAB_TIMEOUT
+    now = time.time()
+    connected = (now - _colab_state["last_seen"]) < COLAB_TIMEOUT
     if not connected and _colab_state["connected"]:
         _colab_state["connected"] = False
+    active = connected and (now - _colab_state["last_activity"]) < COLAB_ACTIVE_TIMEOUT
     return JSONResponse({
         "connected": connected,
         "device": _colab_state["device"] if connected else None,
         "paused": _colab_state["paused"],
+        "active": active,
     })
