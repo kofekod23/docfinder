@@ -132,6 +132,25 @@ L'interface de recherche est disponible sur **http://localhost:8000**.
 
 Le modèle `paraphrase-multilingual-mpnet-base-v2` est chargé une seule fois au démarrage (~5s, ~500 MB RAM). Chaque requête de recherche est vectorisée localement sur CPU.
 
+### Redémarrer uvicorn (mode dev, reload actif)
+
+À lancer depuis la racine du projet :
+
+```bash
+# 1. Stopper l'instance en cours
+pkill -f "uvicorn server.main"
+
+# 2. Relancer en arrière-plan, logs dans docfinder.log
+nohup python -m uvicorn server.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir server --reload-dir shared >> docfinder.log 2>&1 &
+sleep 3
+pgrep -f "uvicorn server.main" | head -3
+
+# 3. Vérifier le démarrage
+tail -n 15 docfinder.log
+```
+
+Le flag `--reload` recharge automatiquement le serveur quand un fichier de `server/` ou `shared/` change — pas besoin de redémarrer manuellement après une édition de code.
+
 ---
 
 ## 6. Utilisation
