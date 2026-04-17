@@ -83,6 +83,8 @@ def files_list(root: str = Query(...)) -> List[dict]:
             except OSError:
                 continue
             size = st.st_size
+            if size == 0:
+                continue
             mode = "filename_only" if size > FIFTY_MB else "full_or_head"
             rel = str(p.relative_to(base))
             out.append({

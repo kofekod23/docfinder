@@ -12,7 +12,7 @@ Responsabilités :
 - Scanner un répertoire récursivement (PDF, DOCX, TXT, MD)
 - Extraire le texte brut (pymupdf pour PDF, python-docx pour DOCX)
 - Découper en chunks de 1500 chars avec overlap 200
-- Générer les vecteurs dense 768-dim (paraphrase-multilingual-mpnet-base-v2) et sparse (YAKE+MD5)
+- Générer les vecteurs dense 1024-dim (intfloat/multilingual-e5-large) et sparse (YAKE+MD5)
 - Insérer dans Qdrant par batches de 32 points (upsert idempotent)
 - Exposer l'état du job (progression, logs, statut) via current_job()
 
@@ -209,6 +209,54 @@ def colab_file_skipped(count: int) -> None:
         if _job.status == JobStatus.RUNNING:
             _job.done += count
             _job.skipped += count
+
+
+def load_indexed_hashes() -> dict[str, str]:
+    """Retourne {doc_id: file_hash} pour les documents **complètement** indexés dans Qdrant.
+
+    Un document est considéré complet seulement si le nombre de chunks présents en base
+    est >= total_chunks stocké dans le payload. Cela évite de skipper des fichiers
+    partiellement indexés après un crash.
+
+    Utilisé par chunks.py pour ignorer les fichiers inchangés lors d'une ré-indexation.
+    file_hash = "<mtime>_<size>" — pas de lecture du contenu, juste stat().
+    """
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        # doc_id → {"file_hash": str, "total_chunks": int, "count": int}
+        docs: dict[str, dict] = {}
+        offset = None
+        while True:
+            records, next_offset = client.scroll(
+                collection_name=COLLECTION,
+                with_payload=["doc_id", "file_hash", "total_chunks"],
+                with_vectors=False,
+                limit=1000,
+                offset=offset,
+            )
+            if not records:
+                break
+            for pt in records:
+                payload = pt.payload or {}
+                doc_id = payload.get("doc_id", "")
+                fhash = payload.get("file_hash", "")
+                total = payload.get("total_chunks", 0)
+                if not doc_id or not fhash:
+                    continue
+                if doc_id not in docs:
+                    docs[doc_id] = {"file_hash": fhash, "total_chunks": total, "count": 0}
+                docs[doc_id]["count"] += 1
+            if next_offset is None:
+                break
+            offset = next_offset
+        # N'inclure que les docs dont tous les chunks sont présents
+        return {
+            doc_id: info["file_hash"]
+            for doc_id, info in docs.items()
+            if info["total_chunks"] > 0 and info["count"] >= info["total_chunks"]
+        }
+    except Exception:
+        return {}
 
 
 def colab_job_start(path: str, total: int) -> None:
@@ -497,6 +545,11 @@ def _run(path: str, reset: bool) -> None:
                 "docx" if suffix in {".docx", ".doc"} else
                 "txt"  if suffix == ".txt"           else "md"
             )
+            try:
+                st = file_path.stat()
+                file_hash = f"{st.st_mtime:.3f}_{st.st_size}"
+            except OSError:
+                file_hash = ""
 
             embeddings = embedder.encode_batch(chunks, batch_size=BATCH_SIZE)
             points: list[PointStruct] = []
@@ -519,6 +572,7 @@ def _run(path: str, reset: bool) -> None:
                         "abs_path": str(file_path),
                         "doc_type": doc_type, "content": chunk_text,
                         "keywords": keywords, "chunk_index": idx,
+                        "file_hash": file_hash,
                     },
                 ))
 

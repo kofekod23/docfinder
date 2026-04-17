@@ -47,11 +47,11 @@ class RemoteEncoder:
         self._url = f"{url}/encode"
         self._headers = {"X-Auth-Token": auth, "Content-Type": "application/json"}
 
-        extra = os.environ.get("COLAB_ENCODE_CF_ACCESS_ID", "").strip()
-        secret = os.environ.get("COLAB_ENCODE_CF_ACCESS_SECRET", "").strip()
-        if extra and secret:
-            self._headers["CF-Access-Client-Id"] = extra
-            self._headers["CF-Access-Client-Secret"] = secret
+        cf_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+        cf_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+        if cf_id and cf_secret:
+            self._headers["CF-Access-Client-Id"] = cf_id
+            self._headers["CF-Access-Client-Secret"] = cf_secret
 
         self._client = httpx.Client(timeout=timeout)
         logger.info("RemoteEncoder targeting %s", self._url)

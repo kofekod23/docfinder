@@ -7,8 +7,18 @@ cloudflared.yml
 *.key
 
 # Données Qdrant locales
+/qdrant
+qdrant/
 qdrant_storage/
+qdrant_config.yaml
 snapshots/
+storage/
+.qdrant-initialized
+
+# Artefacts locaux
+tmp/
+graphify-out/
+*.bak
 
 # Environnement Python
 .venv/
@@ -27,3 +37,4 @@ __pycache__/
 
 # Logs
 *.log
+.env

@@ -1,11 +1,13 @@
 """
-Générateur de chunks pour l'endpoint /chunks.
+Générateur de blocs texte pour l'endpoint /chunks.
 
-Extrait le texte des documents, les découpe, calcule les sparse vectors YAKE,
-et émet une ligne JSON par chunk (NDJSON).
-Colab consomme ce flux pour calculer les embeddings sur GPU.
+Extrait le texte des documents et émet une ligne JSON par fichier (NDJSON).
+Colab consomme ce flux pour effectuer le chunking sémantique, le calcul des
+vecteurs sparse YAKE et l'embedding dense sur GPU.
 
-Toutes les opérations bloquantes (I/O fichier, extraction PDF/DOCX, YAKE)
+PDF scannés : fallback OCR via pytesseract si la page renvoie < 10 caractères.
+
+Toutes les opérations bloquantes (I/O fichier, extraction PDF/DOCX, OCR)
 tournent dans un thread pool via run_in_executor pour ne pas bloquer
 l'event loop asyncio — ce qui garantit un vrai streaming HTTP incrémental.
 """
@@ -19,142 +21,75 @@ import re
 from pathlib import Path
 from typing import AsyncGenerator
 
-import yake
-
-from server.indexer import colab_job_start
+from server.indexer import colab_job_start, load_indexed_hashes
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
 
-_yake_extractor = yake.KeywordExtractor(lan="fr", n=3, dedupLim=0.7, top=20)
 
-
-def _kw_index(kw: str) -> int:
-    """Hash MD5 → indice entier dans l'espace sparse [0, 2^20).
-
-    Identique à server/indexer.py et local_indexer.py — tous les modules
-    doivent rester synchronisés pour que les vecteurs sparse soient comparables.
-    """
-    return int(hashlib.md5(kw.lower().encode()).hexdigest(), 16) % (2 ** 20)
-
-
-def _build_sparse(text: str) -> tuple[list[int], list[float]]:
-    """Vecteur sparse YAKE : n-grammes → (indices, values) normalisés dans [0, 1].
-
-    Utilisé ici pour pré-calculer les sparse vectors côté serveur local avant
-    d'envoyer les chunks à Colab. Colab n'a donc qu'à ajouter les embeddings dense.
-    """
-    pairs = _yake_extractor.extract_keywords(text)
-    if not pairs:
-        return [], []
-    raw = {_kw_index(kw): 1.0 / (s + 1e-9) for kw, s in pairs}
-    max_v = max(raw.values())
-    return list(raw.keys()), [v / max_v for v in raw.values()]
+def _file_hash(path: Path) -> str:
+    """Empreinte rapide basée sur mtime + taille — aucune lecture du contenu."""
+    try:
+        st = path.stat()
+        return f"{st.st_mtime:.3f}_{st.st_size}"
+    except OSError:
+        return ""
 
 
 def _extract_text(path: Path) -> str:
     """Extrait le texte brut d'un fichier (bloquant — appeler via run_in_executor).
 
+    PDF scannés : si une page retourne < 10 caractères, tente un OCR via
+    pytesseract (résolution ×2 pour une meilleure qualité). Les pages sans texte
+    ni OCR sont ignorées silencieusement.
+
     Parseurs : pymupdf (.pdf), python-docx (.docx/.doc), lecture directe (.txt/.md).
-    Retourne "" si le fichier est illisible (PDF scanné, chiffré, encodage cassé).
+    Retourne "" si le fichier est illisible (PDF chiffré, encodage cassé).
     """
     try:
         s = path.suffix.lower()
         if s == ".pdf":
             import fitz
-            return "\n".join(p.get_text() for p in fitz.open(str(path)))
+            page_texts: list[str] = []
+            for page in fitz.open(str(path)):
+                text = page.get_text()
+                if len(text.strip()) < 10:
+                    try:
+                        import io
+
+                        import pytesseract
+                        from PIL import Image
+
+                        mat = fitz.Matrix(2, 2)
+                        pix = page.get_pixmap(matrix=mat)
+                        img = Image.open(io.BytesIO(pix.tobytes("png")))
+                        text = pytesseract.image_to_string(img, lang="fra+eng")
+                    except Exception as ocr_err:
+                        log.warning(
+                            "OCR échoué page %d de %s : %s",
+                            page.number, path.name, ocr_err,
+                        )
+                page_texts.append(text)
+            return "\n".join(page_texts)
         if s in {".docx", ".doc"}:
             from docx import Document
             return "\n".join(p.text for p in Document(str(path)).paragraphs)
         if s in {".txt", ".md"}:
-            return path.read_text(errors="ignore")
+            with path.open(errors="ignore") as f:
+                return f.read(1024 * 1024)  # 1 Mo max
     except Exception as e:
         log.warning("Extraction échouée %s : %s", path.name, e)
     return ""
 
 
-def _split_sentences(text: str) -> list[str]:
-    """Découpe un texte en phrases sur les ponctuations finales."""
-    parts = re.split(r"(?<=[.!?»])\s+", text.strip())
-    return [p for p in parts if p.strip()]
-
-
-def _chunk(text: str) -> list[str]:
-    """Découpage hybride : paragraphes → phrases → overlap sémantique.
-
-    1. Préserve les sauts de paragraphe (double newline).
-    2. Fusionne les petits paragraphes jusqu'à CHUNK_SIZE.
-    3. Découpe les paragraphes trop longs par phrase.
-    4. Overlap : reprend la queue du chunk précédent depuis un début de phrase.
-    """
-    # Normalise sans écraser les séparations de paragraphe
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if not text:
-        return []
-
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-
-    raw: list[str] = []
-    current = ""
-
-    for para in paragraphs:
-        if len(para) > CHUNK_SIZE:
-            # Vide le buffer courant avant de découper par phrase
-            if current:
-                raw.append(current)
-                current = ""
-            buf = ""
-            for sent in _split_sentences(para):
-                if len(buf) + len(sent) + 1 <= CHUNK_SIZE:
-                    buf = (buf + " " + sent).strip() if buf else sent
-                else:
-                    if buf:
-                        raw.append(buf)
-                    buf = sent
-            if buf:
-                raw.append(buf)
-        elif len(current) + len(para) + 2 <= CHUNK_SIZE:
-            current = (current + "\n\n" + para).strip() if current else para
-        else:
-            if current:
-                raw.append(current)
-            current = para
-
-    if current:
-        raw.append(current)
-
-    if not raw:
-        return []
-
-    # Overlap sémantique : on reprend la queue du chunk précédent
-    # en cherchant un début de phrase pour ne pas couper à mi-mot.
-    result: list[str] = [raw[0]]
-    for i in range(1, len(raw)):
-        tail = raw[i - 1][-CHUNK_OVERLAP:]
-        m = re.search(r"(?<=[\.\!\?»])\s+\S", tail)
-        if m:
-            tail = tail[m.start():].strip()
-        elif len(tail) > CHUNK_OVERLAP // 2:
-            # Pas de ponctuation trouvée — on prend depuis le premier espace
-            sp = tail.find(" ")
-            tail = tail[sp + 1:].strip() if sp != -1 else ""
-        else:
-            tail = ""
-        result.append((tail + " " + raw[i]).strip() if tail else raw[i])
-
-    return result
-
-
-def _iter_files(root: Path) -> list[Path]:
+def _iter_files(
+    root: Path, exclude: frozenset[str] | None = None
+) -> list[Path]:
     """Retourne la liste complète des fichiers indexables sous root (bloquant).
 
-    Contrairement à server/indexer.py qui yield, retourne une liste complète
-    car le total est émis dans la ligne NDJSON {type: "meta"} avant le streaming.
-    Exclusions identiques : .icloud, ~$*, .* (cachés macOS).
+    exclude : ensemble de noms de sous-répertoires immédiats à ignorer.
+    Exclusions systématiques : .icloud, ~$*, .* (cachés macOS).
     """
     result = []
     for p in root.rglob("*"):
@@ -162,6 +97,13 @@ def _iter_files(root: Path) -> list[Path]:
             continue
         if p.name.startswith("~$") or p.name.startswith("."):
             continue
+        if exclude:
+            try:
+                rel = p.relative_to(root)
+                if rel.parts and rel.parts[0] in exclude:
+                    continue
+            except ValueError:
+                pass
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
             result.append(p)
     return result
@@ -170,23 +112,30 @@ def _iter_files(root: Path) -> list[Path]:
 def _name_hint(file_path: Path) -> str:
     """Construit un texte lisible à partir du nom et du chemin du fichier.
 
-    Remplace les séparateurs (_-) par des espaces pour que YAKE et le modèle
-    d'embedding voient des mots normaux plutôt que des tokens collés.
+    Remplace les séparateurs (_-) par des espaces pour que le modèle d'embedding
+    voie des mots normaux plutôt que des tokens collés.
     Ex : "Contrat_Loyer-2024" → "Contrat Loyer 2024"
-
-    Ce hint est préfixé au contenu textuel de chaque fichier pour que le nom
-    influence l'embedding dense et les keywords YAKE sparse, même quand le
-    texte principal est pauvre ou absent (PDF scanné, fichier chiffré).
     """
     parts = list(file_path.parts)
     cleaned = [re.sub(r"[_\-]+", " ", p) for p in parts]
     return " ".join(cleaned)
 
 
-def _process_file(file_path: Path, root: Path) -> dict:
-    """Traite un fichier et retourne ses chunks + métadonnées (bloquant)."""
+def _process_file(
+    file_path: Path, root: Path, existing_hashes: dict[str, str]
+) -> dict:
+    """Traite un fichier et retourne son bloc de texte brut (bloquant).
+
+    Si le fichier est déjà indexé (même file_hash), retourne skip=True.
+    Le chunking sémantique, YAKE et l'embedding sont délégués à Colab GPU.
+    """
     rel = str(file_path.relative_to(root))
     doc_id = hashlib.md5(str(file_path).encode()).hexdigest()
+    fhash = _file_hash(file_path)
+    mtime = int(file_path.stat().st_mtime) if fhash else 0
+    if fhash and existing_hashes.get(doc_id) == fhash:
+        return {"skip": True, "rel": rel}
+
     suffix = file_path.suffix.lower()
     doc_type = (
         "pdf"  if suffix == ".pdf"            else
@@ -198,48 +147,33 @@ def _process_file(file_path: Path, root: Path) -> dict:
     hint = _name_hint(file_path)
 
     if not text.strip():
-        # PDF scanné, fichier chiffré, encodage cassé → chemin comme contenu
         text = hint
     else:
-        # Préfixe le nom pour que YAKE et l'embedding voient toujours les
-        # mots-clés du fichier, même quand le texte principal est générique.
         text = hint + "\n" + text
 
-    chunks = _chunk(text)
-
-    if not chunks:
+    if not text.strip():
         return {"skip": True, "rel": rel}
 
-    chunk_lines = []
-    for idx, chunk_text in enumerate(chunks):
-        chunk_id = f"{doc_id}_{idx}"
-        kw_pairs = _yake_extractor.extract_keywords(chunk_text)
-        keywords = [kw for kw, _ in kw_pairs]
-        sp_i, sp_v = _build_sparse(chunk_text)
-        chunk_lines.append({
-            "type": "chunk",
-            "doc_id": doc_id,
-            "chunk_id": chunk_id,
-            "point_id": int(hashlib.md5(chunk_id.encode()).hexdigest(), 16) % (2 ** 63),
-            "title": file_path.stem,
-            "path": rel,
-            "abs_path": str(file_path),
-            "doc_type": doc_type,
-            "content": chunk_text,
-            "keywords": keywords,
-            "chunk_index": idx,
-            "sparse_indices": sp_i,
-            "sparse_values": sp_v,
-        })
-
-    return {"skip": False, "rel": rel, "chunks": chunk_lines}
+    return {
+        "skip": False,
+        "rel": rel,
+        "block": {
+            "type":      "block",
+            "doc_id":    doc_id,
+            "title":     file_path.stem,
+            "path":      rel,
+            "abs_path":  str(file_path),
+            "doc_type":  doc_type,
+            "content":   text,
+            "file_hash": fhash,
+            "mtime":     mtime,
+        },
+    }
 
 
 # Nombre de fichiers traités en parallèle côté Mac.
-# Chaque worker occupe un thread (extraction texte + YAKE).
-# 2 workers suffisent à alimenter le GPU T4 sans surcharger le Mac.
+# Chaque worker occupe un thread (extraction texte, OCR éventuel).
 _CHUNK_WORKERS = 4
-
 
 # Délai max sans émettre de données avant d'envoyer un keepalive (secondes).
 # Cloudflare coupe les connexions streaming silencieuses après ~30s.
@@ -248,16 +182,22 @@ _KEEPALIVE_INTERVAL = 10.0
 _KEEPALIVE_LINE = json.dumps({"type": "keepalive"}).encode() + b"\n"
 
 
-async def iter_chunks_json(path: str) -> AsyncGenerator[bytes, None]:
+async def iter_chunks_json(
+    path: str, exclude: list[str] | None = None
+) -> AsyncGenerator[bytes, None]:
     """
-    Génère des lignes NDJSON, une par chunk.
+    Génère des lignes NDJSON, une par fichier.
 
-    Chaque opération bloquante (scan disque, extraction texte, YAKE) tourne
+    Protocole :
+      {"type": "meta",  "total_files": N}          — nb total de fichiers
+      {"type": "file",  "path": "..."}              — fichier en cours
+      {"type": "block", ...}                        — texte brut du fichier
+      {"type": "skip",  "path": "..."}              — fichier déjà indexé
+      {"type": "keepalive"}                         — anti-timeout Cloudflare
+      {"type": "done"}                              — fin du flux
+
+    Chaque opération bloquante (scan disque, extraction texte, OCR) tourne
     dans un thread pool via run_in_executor pour ne jamais bloquer l'event loop.
-    _CHUNK_WORKERS fichiers sont traités en parallèle pour saturer le GPU Colab.
-
-    Un keepalive est émis toutes les _KEEPALIVE_INTERVAL secondes sans données
-    pour éviter que Cloudflare (ou tout proxy) coupe la connexion streaming.
     """
     loop = asyncio.get_event_loop()
     root = Path(path).expanduser()
@@ -266,23 +206,24 @@ async def iter_chunks_json(path: str) -> AsyncGenerator[bytes, None]:
         yield json.dumps({"error": f"Dossier introuvable : {path}"}).encode() + b"\n"
         return
 
-    # Scan disque dans un thread — peut être lent sur iCloud
-    files: list[Path] = await loop.run_in_executor(None, _iter_files, root)
+    excl = frozenset(exclude) if exclude else None
+
+    files, existing_hashes = await asyncio.gather(
+        loop.run_in_executor(None, _iter_files, root, excl),
+        loop.run_in_executor(None, load_indexed_hashes),
+    )
 
     yield json.dumps({"type": "meta", "total_files": len(files)}).encode() + b"\n"
 
-    # Signaler le démarrage au job tracker pour que l'UI reflète la progression Colab
     colab_job_start(path, len(files))
 
     sem = asyncio.Semaphore(_CHUNK_WORKERS)
 
     async def _process(fp: Path) -> dict:
         async with sem:
-            return await loop.run_in_executor(None, _process_file, fp, root)
+            return await loop.run_in_executor(None, _process_file, fp, root, existing_hashes)
 
     pending: set[asyncio.Task] = {asyncio.ensure_future(_process(fp)) for fp in files}
-
-    last_emit = loop.time()
 
     while pending:
         done_set, pending = await asyncio.wait(
@@ -292,26 +233,17 @@ async def iter_chunks_json(path: str) -> AsyncGenerator[bytes, None]:
         )
 
         if not done_set:
-            # Timeout sans résultat — envoyer un keepalive
             yield _KEEPALIVE_LINE
-            last_emit = loop.time()
             continue
 
         for task in done_set:
             result: dict = task.result()
-            last_emit = loop.time()
 
             if result["skip"]:
                 yield json.dumps({"type": "skip", "path": result["rel"]}).encode() + b"\n"
                 continue
 
-            yield json.dumps({
-                "type": "file",
-                "path": result["rel"],
-                "chunks": len(result["chunks"]),
-            }).encode() + b"\n"
-
-            for chunk_data in result["chunks"]:
-                yield json.dumps(chunk_data).encode() + b"\n"
+            yield json.dumps({"type": "file", "path": result["rel"]}).encode() + b"\n"
+            yield json.dumps(result["block"]).encode() + b"\n"
 
     yield json.dumps({"type": "done"}).encode() + b"\n"

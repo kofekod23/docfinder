@@ -1,6 +1,7 @@
 """V2 admin endpoints (spec §11-§13)."""
 from __future__ import annotations
 
+import uuid
 from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, HTTPException
@@ -105,6 +106,7 @@ def upsert_v2(body: UpsertV2Request) -> dict:
             "sparse": qm.SparseVector(indices=p.sparse_indices,
                                       values=p.sparse_values),
         }
-        points.append(qm.PointStruct(id=p.id, vector=vectors, payload=p.payload))
+        pid = str(uuid.uuid5(uuid.NAMESPACE_URL, p.id))
+        points.append(qm.PointStruct(id=pid, vector=vectors, payload=p.payload))
     q.upsert(collection_name=_collection, points=points, wait=True)
     return {"upserted": len(points)}

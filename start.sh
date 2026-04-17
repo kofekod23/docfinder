@@ -15,6 +15,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# ── Variables d'environnement (.env gitignored) ───────────────────────────────
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 # ── Constantes ────────────────────────────────────────────────────────────────
 QDRANT_VERSION="v1.13.4"
 QDRANT_PORT=6333
@@ -91,19 +99,22 @@ else
 fi
 
 # ── 4. Tunnel Cloudflare (daemon indépendant) ─────────────────────────────────
-if command -v cloudflared &>/dev/null; then
-    # Lancer cloudflared dans un sous-shell complètement détaché du processus
-    # courant, avec son propre watchdog — il survit aux redémarrages d'uvicorn.
+if command -v cloudflared &>/dev/null && [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+    # Named tunnel (URL fixe) — survit aux redémarrages d'uvicorn.
+    # Le token est dans .env (gitignored).
     (
         while true; do
-            cloudflared tunnel --url http://localhost:8000 \
-                --no-autoupdate 2>&1 | grep -E "https://|ERR|error" || true
+            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" \
+                2>&1 | grep -E "connected|ERR|error|INF" || true
             echo "[cloudflared] tunnel coupé — redémarrage dans 5s…"
             sleep 5
         done
     ) &
     CLOUDFLARED_PID=$!
     echo "→ Cloudflare tunnel démarré (PID $CLOUDFLARED_PID)"
+    echo "   URL publique : ${DOCFINDER_PUBLIC_URL:-https://docfinder.jinkohub.digital}"
+elif command -v cloudflared &>/dev/null; then
+    echo "→ CLOUDFLARE_TUNNEL_TOKEN absent dans .env — tunnel non démarré"
 else
     echo "→ cloudflared absent — tunnel Cloudflare non démarré (optionnel)"
 fi
@@ -124,6 +135,10 @@ POLL=30        # secondes entre chaque health check
 set +e
 
 while true; do
+    # Libérer le port avant tout démarrage — un enfant --reload peut survivre à un crash
+    lsof -ti tcp:8000 | xargs kill -9 2>/dev/null || true
+    sleep 1
+
     uvicorn server.main:app --port 8000 --reload --reload-dir server --reload-dir shared &
     UVICORN_PID=$!
     echo "[watchdog] uvicorn démarré (PID $UVICORN_PID)"
