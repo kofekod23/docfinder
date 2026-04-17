@@ -12,6 +12,20 @@ from typing import Optional
 import httpx
 
 
+# Cloudflare tunnel rejette les bodies >~100 MB (HTTP 413). On batch côté
+# client à 80 MiB pour garder une marge sous ce plafond edge.
+_UPSERT_CLIENT_SOFT_LIMIT_BYTES = 80 * 1024 * 1024
+
+
+def _estimate_point_bytes(p: dict) -> int:
+    """Approximation JSON d'un point upsert-v2 (~20 bytes par float)."""
+    dense = p.get("dense") or []
+    colbert = p.get("colbert_vecs") or []
+    sparse_values = p.get("sparse_values") or []
+    colbert_floats = sum(len(v) for v in colbert)
+    return (len(dense) + colbert_floats + len(sparse_values)) * 20
+
+
 class MacClient:
     def __init__(self, base_url: str, transport: Optional[httpx.BaseTransport] = None,
                  timeout: float = 60.0):
@@ -62,9 +76,38 @@ class MacClient:
         r.raise_for_status()
 
     def upsert_chunks_v2(self, points: list[dict]) -> dict:
-        r = self._client.post(f"{self.base}/admin/upsert-v2", json={"points": points})
-        r.raise_for_status()
-        return r.json()
+        if not points:
+            return {"upserted": 0}
+
+        batches: list[list[dict]] = []
+        current: list[dict] = []
+        current_bytes = 0
+        for p in points:
+            est = _estimate_point_bytes(p)
+            if current and current_bytes + est > _UPSERT_CLIENT_SOFT_LIMIT_BYTES:
+                batches.append(current)
+                current = []
+                current_bytes = 0
+            current.append(p)
+            current_bytes += est
+        if current:
+            batches.append(current)
+
+        upserted = 0
+        for i, batch in enumerate(batches):
+            r = self._client.post(
+                f"{self.base}/admin/upsert-v2", json={"points": batch}
+            )
+            r.raise_for_status()
+            data = r.json()
+            upserted += int(data.get("upserted", len(batch)))
+            if len(batches) > 1:
+                print(
+                    f"[MacClient] upsert-v2 batch {i + 1}/{len(batches)} "
+                    f"({len(batch)} points, ~{sum(_estimate_point_bytes(p) for p in batch) // (1024 * 1024)} MiB)",
+                    flush=True,
+                )
+        return {"upserted": upserted}
 
     def push_progress(self, report: dict) -> None:
         r = self._client.post(f"{self.base}/admin/progress", json=report)
