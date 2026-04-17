@@ -134,7 +134,7 @@ Le modèle `paraphrase-multilingual-mpnet-base-v2` est chargé une seule fois au
 
 ### Redémarrer uvicorn (mode dev, reload actif)
 
-À lancer depuis `/Users/julien/docfinder` :
+À lancer depuis la racine du projet :
 
 ```bash
 # 1. Stopper l'instance en cours
