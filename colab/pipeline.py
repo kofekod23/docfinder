@@ -76,6 +76,14 @@ async def process_one_doc(
     if not chunks:
         return
 
+    max_chunks_env = os.environ.get("DOCFINDER_MAX_CHUNKS_PER_DOC", "32").strip()
+    if max_chunks_env.isdigit() and int(max_chunks_env) > 0:
+        cap = int(max_chunks_env)
+        if len(chunks) > cap:
+            print(f"[process_one_doc] TRUNCATE {doc_id[:12]} {len(chunks)} → {cap} chunks",
+                  flush=True)
+            chunks = chunks[:cap]
+
     texts = [c.text for c in chunks]
     enc = embedder.encode(texts)
 

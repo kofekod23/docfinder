@@ -101,15 +101,33 @@ class UpsertV2Request(BaseModel):
     points: List[UpsertPointV2]
 
 
-# Qdrant default JSON body limit is 32 MiB. ColBERT multi-vectors weigh
-# ~1-2 MiB per chunk, so we keep batches small to stay well under the cap.
-_UPSERT_BATCH = 4
+# Qdrant default JSON body limit is 32 MiB. ColBERT multi-vectors dominate
+# payload size (~20 bytes per float in JSON), so we sub-batch by estimated
+# bytes rather than by point count.
+_UPSERT_SOFT_LIMIT_BYTES = 20 * 1024 * 1024
+
+
+def _estimate_point_bytes(p: UpsertPointV2) -> int:
+    colbert_floats = sum(len(v) for v in p.colbert_vecs)
+    return (len(p.dense) + colbert_floats + len(p.sparse_values)) * 20
 
 
 @router.post("/admin/upsert-v2")
 def upsert_v2(body: UpsertV2Request) -> dict:
     q = _require_qdrant()
-    points = []
+    batch: list = []
+    batch_bytes = 0
+    upserted = 0
+
+    def flush() -> None:
+        nonlocal batch, batch_bytes, upserted
+        if not batch:
+            return
+        q.upsert(collection_name=_collection, points=batch, wait=True)
+        upserted += len(batch)
+        batch = []
+        batch_bytes = 0
+
     for p in body.points:
         vectors: dict[str, Any] = {
             "dense": p.dense,
@@ -118,8 +136,11 @@ def upsert_v2(body: UpsertV2Request) -> dict:
                                       values=p.sparse_values),
         }
         pid = str(uuid.uuid5(uuid.NAMESPACE_URL, p.id))
-        points.append(qm.PointStruct(id=pid, vector=vectors, payload=p.payload))
-    for i in range(0, len(points), _UPSERT_BATCH):
-        q.upsert(collection_name=_collection,
-                 points=points[i:i + _UPSERT_BATCH], wait=True)
-    return {"upserted": len(points)}
+        point = qm.PointStruct(id=pid, vector=vectors, payload=p.payload)
+        est = _estimate_point_bytes(p)
+        if batch and batch_bytes + est > _UPSERT_SOFT_LIMIT_BYTES:
+            flush()
+        batch.append(point)
+        batch_bytes += est
+    flush()
+    return {"upserted": upserted}
