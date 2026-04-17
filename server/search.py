@@ -13,6 +13,8 @@ Aucun appel externe au moment de la recherche.
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from typing import Dict, List, Tuple
 
 import yake
@@ -36,6 +38,55 @@ _yake_extractor = yake.KeywordExtractor(
     dedupLim=0.7,
     top=20,
 )
+
+
+# Mots trop génériques pour discriminer un document : ils bruiteraient
+# le boost filename/titre (ex. "documents médicaux" → matche tout fichier
+# contenant "documents" dans le path, même sans lien avec le sujet médical).
+_STOPWORDS_BOOST: frozenset[str] = frozenset({
+    # FR
+    "document", "documents", "fichier", "fichiers", "dossier", "dossiers",
+    "liste", "page", "pages", "annexe", "annexes", "copie", "copies",
+    "version", "extrait", "note", "notes",
+    # EN
+    "document", "file", "files", "folder", "folders", "list", "page",
+    "pages", "annex", "copy", "note", "notes", "and", "the", "for", "with",
+})
+
+
+def _extract_boost_tokens(query: str) -> set[str]:
+    """Extract filename-boost tokens from a query.
+
+    Admission rules:
+      - normalized token of length >= 4 and not in stopwords, OR
+      - normalized token of length 2-3 if it was fully uppercase in the
+        original query (acronym heuristic: PV, SEO, CV, RH).
+
+    Returns a set of accent-stripped lowercase tokens.
+    """
+    uppercase_tokens = {
+        _normalize_text(w) for w in re.findall(r"\b[A-Z]{2,}\b", query)
+    }
+    tokens: set[str] = set()
+    for t in _normalize_text(query).split():
+        if t in _STOPWORDS_BOOST:
+            continue
+        if len(t) >= 4:
+            tokens.add(t)
+        elif 2 <= len(t) <= 3 and t in uppercase_tokens:
+            tokens.add(t)
+    return tokens
+
+
+def _normalize_text(s: str) -> str:
+    """Lower + strip accents (NFD) + replace non-alphanumeric runs with spaces.
+
+    Used for tolerant filename/title matching: "médicaments" → "medicaments",
+    "ordonnance-de-medicaments_2026.pdf" → "ordonnance de medicaments 2026 pdf".
+    """
+    nfd = unicodedata.normalize("NFD", s.lower())
+    no_accents = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]+", " ", no_accents).strip()
 
 
 def _keyword_to_sparse_index(keyword: str) -> int:
@@ -304,49 +355,99 @@ class SearchEngine:
 def search_v2(qdrant, embedder, query: str,
               collection: str = "docfinder_v2",
               limit: int = 10,
-              prefetch_limit: int = 200) -> list[SearchResult]:
-    """Dense + sparse prefetch, ColBERT MaxSim rerank, groupé par doc_id.
+              prefetch_limit: int = 300) -> list[SearchResult]:
+    """Fusion RRF au niveau **document** (pas chunk).
 
-    Utilise `query_points_groups` de Qdrant pour diversifier : au plus
-    `group_size=1` chunk par document dans le top-N. Sans ce garde-fou,
-    un gros document multi-chunks monopolise la liste (chaque chunk
-    matche isolément les mots de la requête → biais lexical).
+    Chaque canal (dense/sparse/colbert) est interrogé séparément; on
+    dédoublonne par doc_id en gardant le meilleur chunk du doc, PUIS on
+    fusionne par RRF. Sans ce garde-fou, un gros document multi-chunks
+    domine: il a N chances d'apparaître en tête dans chaque canal face
+    à un document 1-chunk pertinent qui ne peut apparaître qu'une fois.
+
+    Qdrant `FusionQuery(RRF)` natif fusionne au niveau chunk — un doc
+    de 20 chunks accumule 20 entrées alors qu'un doc de 1 chunk en a 1,
+    d'où disparition des petits documents pertinents du top-N.
     """
     enc = embedder.encode([query])
     dense_q = enc.dense[0]
     sparse_q = qm.SparseVector(indices=enc.sparse[0][0], values=enc.sparse[0][1])
     colbert_q = enc.colbert[0]
 
-    prefetch = [
-        qm.Prefetch(query=dense_q, using="dense", limit=prefetch_limit),
-        qm.Prefetch(query=sparse_q, using="sparse", limit=prefetch_limit),
-    ]
+    def _rank_docs(q, using: str) -> list[tuple[str, int, object]]:
+        """Retourne [(doc_id, rank_0based, point)] dédoublonné: 1 chunk/doc."""
+        resp = qdrant.query_points(
+            collection_name=collection, query=q, using=using,
+            limit=prefetch_limit, with_payload=True,
+        )
+        seen: dict[str, tuple[int, object]] = {}
+        for rank, pt in enumerate(resp.points):
+            pl = pt.payload or {}
+            doc_id = pl.get("doc_id") or str(pt.id)
+            if doc_id not in seen:
+                seen[doc_id] = (rank, pt)
+        return [(d, r, p) for d, (r, p) in seen.items()]
 
-    resp = qdrant.query_points_groups(
-        collection_name=collection,
-        prefetch=prefetch,
-        query=colbert_q,
-        using="colbert",
-        group_by="doc_id",
-        group_size=1,
-        limit=limit,
-        with_payload=True,
+    channels = (
+        _rank_docs(dense_q, "dense"),
+        _rank_docs(sparse_q, "sparse"),
+        _rank_docs(colbert_q, "colbert"),
     )
 
+    rrf: dict[str, float] = {}
+    best_hit: dict[str, object] = {}
+    best_rank: dict[str, int] = {}
+    for channel in channels:
+        for doc_id, rank, pt in channel:
+            rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (RRF_K + rank)
+            if doc_id not in best_rank or rank < best_rank[doc_id]:
+                best_rank[doc_id] = rank
+                best_hit[doc_id] = pt
+
+    # Filename/title boost — signal très fiable en recherche documentaire.
+    # Un token de la requête qui apparaît dans le path/title récolte 1/RRF_K,
+    # soit l'équivalent d'un rang #1 dans un canal virtuel "filename".
+    #
+    # Règles d'admission des tokens :
+    #   - len >= 4 et pas dans STOPWORDS (filtre "documents", "liste", etc.)
+    #   - OU len 2-3 si le token était UPPERCASE dans la requête d'origine
+    #     (heuristique pour acronymes : PV, SEO, CV, RH)
+    #
+    # Pondération par rareté : si un token apparaît dans > RARITY_THRESHOLD
+    # du pool (best_hit), son poids est divisé par 2 — il discrimine mal.
+    RARITY_THRESHOLD = 0.30
+    q_tokens = _extract_boost_tokens(query)
+    if q_tokens and best_hit:
+        pool_size = len(best_hit)
+        pool_haystacks = {
+            doc_id: _normalize_text(
+                f"{(getattr(pt, 'payload', None) or {}).get('path', '')} "
+                f"{(getattr(pt, 'payload', None) or {}).get('title', '')}"
+            )
+            for doc_id, pt in best_hit.items()
+        }
+        token_weights: dict[str, float] = {}
+        for t in q_tokens:
+            df = sum(1 for h in pool_haystacks.values() if t in h)
+            base = 1.0 / RRF_K
+            token_weights[t] = base * 0.5 if df / pool_size > RARITY_THRESHOLD else base
+        for doc_id, haystack in pool_haystacks.items():
+            boost = sum(w for t, w in token_weights.items() if t in haystack)
+            if boost:
+                rrf[doc_id] += boost
+
+    top = sorted(rrf.items(), key=lambda x: -x[1])[:limit]
     out: list[SearchResult] = []
-    for group in resp.groups:
-        if not group.hits:
-            continue
-        pt = group.hits[0]
-        pl = pt.payload or {}
+    for doc_id, score in top:
+        pt = best_hit[doc_id]
+        pl = getattr(pt, "payload", None) or {}
         out.append(SearchResult(
             chunk_id=str(pt.id),
-            doc_id=pl.get("doc_id", "") or str(pt.id),
+            doc_id=doc_id,
             title=pl.get("title", ""),
             path=pl.get("path", ""),
             abs_path=pl.get("abs_path", ""),
             doc_type=pl.get("doc_type", ""),
-            score=float(pt.score),
+            score=round(score, 4),
             excerpt=pl.get("content", ""),
             keywords=pl.get("keywords_doc", []),
         ))
