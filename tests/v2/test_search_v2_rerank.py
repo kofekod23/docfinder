@@ -38,3 +38,13 @@ def test_rerank_results_empty_passthrough():
 def test_rerank_results_no_reranker_passthrough():
     results = [_mk("A", "a"), _mk("B", "b")]
     assert rerank_results("q", results, None, top_n=2) is results
+
+
+def test_rerank_results_top_n_zero_skips_reranker():
+    class FailingRe:
+        def rerank(self, query, docs):
+            raise AssertionError("reranker should not be called when top_n=0")
+
+    results = [_mk(f"d{i}", f"E{i}") for i in range(3)]
+    out = rerank_results("q", results, FailingRe(), top_n=0)
+    assert out == results

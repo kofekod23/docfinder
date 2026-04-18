@@ -470,7 +470,7 @@ def fuse_v2(
 def rerank_results(
     query: str,
     results: list[SearchResult],
-    reranker,
+    reranker: object | None = None,
     *,
     top_n: int = 20,
 ) -> list[SearchResult]:
@@ -479,7 +479,7 @@ def rerank_results(
     Les résultats au-delà de `top_n` sont conservés dans leur ordre d'origine.
     Si `reranker` est None, retourne la liste inchangée.
     """
-    if reranker is None or not results:
+    if reranker is None or not results or top_n <= 0:
         return results
     head = results[:top_n]
     tail = results[top_n:]
