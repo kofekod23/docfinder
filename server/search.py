@@ -484,7 +484,12 @@ def rerank_results(
     head = results[:top_n]
     tail = results[top_n:]
     excerpts = [r.excerpt or r.title or r.path for r in head]
-    scores = reranker.rerank(query, excerpts)
+    try:
+        scores = reranker.rerank(query, excerpts)
+    except Exception as exc:
+        # Colab tunnel down, timeout, etc. — dégrader vers fusion-only plutôt que 500.
+        print(f"[search] rerank failed, falling back to fusion order: {exc}")
+        return results
     order = sorted(range(len(head)), key=lambda i: -scores[i])
     reordered = []
     for new_rank, i in enumerate(order):
