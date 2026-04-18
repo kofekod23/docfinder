@@ -57,7 +57,14 @@ def run_batch(client: httpx.Client, mode: str) -> dict:
                 {"query": query_text, "error": f"HTTP {resp.status_code}"}
             )
             continue
-        hits = resp.json().get("results", [])
+        try:
+            payload = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            out["results"].append(
+                {"query": query_text, "error": "invalid JSON response"}
+            )
+            continue
+        hits = payload.get("results", [])
         rank = rank_of_hit(hits, path_substring)
         out["results"].append(
             {
@@ -77,9 +84,19 @@ def mrr_at_k(run: dict, k: int = TOP_K) -> float:
 
 
 def compare(a_path: str, b_path: str) -> None:
-    a = json.loads(Path(a_path).read_text())
-    b = json.loads(Path(b_path).read_text())
-    assert len(a["results"]) == len(b["results"])
+    try:
+        a = json.loads(Path(a_path).read_text())
+        b = json.loads(Path(b_path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"compare: cannot read input files: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if len(a["results"]) != len(b["results"]):
+        print(
+            f"compare: result lengths differ "
+            f"({len(a['results'])} vs {len(b['results'])})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     wins_b, wins_a, same = 0, 0, 0
     for ra, rb in zip(a["results"], b["results"]):
