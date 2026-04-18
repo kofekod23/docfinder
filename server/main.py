@@ -31,7 +31,7 @@ from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexa
 from server.chunks import iter_chunks_json
 from server.files_api import router as files_router
 from server.admin_v2 import router as admin_v2_router, set_qdrant_client
-from server.search import SearchEngine, search_v2
+from server.search import SearchEngine, search_v2, search_v2_tunable, retrieve_v2_channels, fuse_v2
 from scripts.setup_qdrant_v2 import ensure_collection
 from shared.schema import SearchResult, SearchQuery
 
@@ -40,6 +40,9 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 # Instance globale du moteur (initialisée dans lifespan)
 _engine: SearchEngine | None = None
+
+# Instance globale du reranker (initialisée dans lifespan si RERANK_ENABLED)
+_reranker = None
 
 # État Colab — mis à jour par heartbeat et upserts
 _colab_state: dict = {
@@ -63,14 +66,24 @@ async def lifespan(app: FastAPI):
     Charge le modèle embedding + initialise le moteur au démarrage.
     Libère proprement à l'arrêt.
     """
-    global _engine
+    global _engine, _reranker
     print("[DocFinder] Démarrage — chargement du moteur de recherche…")
     _engine = SearchEngine()
     ensure_collection(_engine.client, name="docfinder_v2")
     set_qdrant_client(_engine.client, collection="docfinder_v2")
+    if os.environ.get("RERANK_ENABLED", "false").lower() in ("true", "1", "yes", "on"):
+        from server.rerank_client import RemoteReranker, RemoteRerankerError
+        try:
+            _reranker = RemoteReranker()
+            print("[DocFinder] Reranker activé.")
+        except RemoteRerankerError as exc:
+            print(f"[DocFinder] Reranker désactivé ({exc}).")
+            _reranker = None
     print("[DocFinder] Prêt sur http://localhost:8000")
     resume_if_needed()
     yield
+    if _reranker is not None:
+        _reranker.close()
     print("[DocFinder] Arrêt du serveur.")
 
 
@@ -154,6 +167,8 @@ async def search(request: Request):
                     body.query,
                     collection="docfinder_v2",
                     limit=body.limit,
+                    reranker=_reranker,
+                    rerank_top_n=int(os.environ.get("RERANK_TOP_N", "20")),
                 ),
             )
         else:
@@ -181,6 +196,133 @@ async def search(request: Request):
             "index.html",
             {"request": request, "results": None, "query": body.query, "error": str(exc)},
         )
+
+
+@app.post("/search_tune")
+async def search_tune(request: Request):
+    """Recherche v2 paramétrable — sert au grid-search.
+
+    Body JSON attendu (tous les poids/seuils optionnels) :
+        {
+            "query": "...",
+            "limit": 10,
+            "prefetch_limit": 300,
+            "w_dense": 1.0,
+            "w_sparse": 1.0,
+            "w_colbert": 1.0,
+            "rrf_k": 60,
+            "filename_boost": 1.0,
+            "rarity_threshold": 0.30,
+            "rarity_factor": 0.5
+        }
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": f"invalid json: {exc}"}, status_code=422)
+
+    query = str(body.get("query") or "").strip()
+    if not query:
+        return JSONResponse({"status": "error", "message": "query is required"}, status_code=422)
+
+    if _engine is None or _engine.embedder_v2 is None:
+        return JSONResponse({"status": "error", "message": "v2 engine not ready"}, status_code=503)
+
+    kwargs = dict(
+        collection="docfinder_v2",
+        limit=int(body.get("limit", 10) or 10),
+        prefetch_limit=int(body.get("prefetch_limit", 300) or 300),
+        w_dense=float(body.get("w_dense", 1.0)),
+        w_sparse=float(body.get("w_sparse", 1.0)),
+        w_colbert=float(body.get("w_colbert", 1.0)),
+        rrf_k=int(body.get("rrf_k", 60) or 60),
+        filename_boost=float(body.get("filename_boost", 1.0)),
+        rarity_threshold=float(body.get("rarity_threshold", 0.30)),
+        rarity_factor=float(body.get("rarity_factor", 0.5)),
+    )
+
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: search_v2_tunable(
+                _engine.qdrant, _engine.embedder_v2, query, **kwargs
+            ),
+        )
+        return JSONResponse(
+            {"status": "ok", "results": [r.model_dump() for r in results]}
+        )
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.post("/search_tune_batch")
+async def search_tune_batch(request: Request):
+    """Batch grid-search : encode la requête une fois, applique N fusions localement.
+
+    Body JSON :
+        {
+            "query": "...",
+            "limit": 10,
+            "prefetch_limit": 300,
+            "configs": [
+                {"name": "...", "w_dense": ..., "w_sparse": ..., "w_colbert": ...,
+                 "rrf_k": ..., "filename_boost": ..., "rarity_threshold": ...,
+                 "rarity_factor": ...},
+                ...
+            ]
+        }
+
+    Réponse :
+        {"status": "ok", "results": {name: [SearchResult, ...], ...}}
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": f"invalid json: {exc}"}, status_code=422)
+
+    query = str(body.get("query") or "").strip()
+    if not query:
+        return JSONResponse({"status": "error", "message": "query is required"}, status_code=422)
+
+    configs = body.get("configs") or []
+    if not isinstance(configs, list) or not configs:
+        return JSONResponse({"status": "error", "message": "configs (list) is required"}, status_code=422)
+
+    if _engine is None or _engine.embedder_v2 is None:
+        return JSONResponse({"status": "error", "message": "v2 engine not ready"}, status_code=503)
+
+    limit = int(body.get("limit", 10) or 10)
+    prefetch_limit = int(body.get("prefetch_limit", 300) or 300)
+
+    def _run_batch() -> dict[str, list]:
+        channels = retrieve_v2_channels(
+            _engine.qdrant, _engine.embedder_v2, query,
+            collection="docfinder_v2", prefetch_limit=prefetch_limit,
+        )
+        out: dict[str, list] = {}
+        for cfg in configs:
+            name = str(cfg.get("name") or "unnamed")
+            results = fuse_v2(
+                channels, query,
+                limit=limit,
+                w_dense=float(cfg.get("w_dense", 1.0)),
+                w_sparse=float(cfg.get("w_sparse", 1.0)),
+                w_colbert=float(cfg.get("w_colbert", 1.0)),
+                rrf_k=int(cfg.get("rrf_k", 60) or 60),
+                filename_boost=float(cfg.get("filename_boost", 1.0)),
+                rarity_threshold=float(cfg.get("rarity_threshold", 0.30)),
+                rarity_factor=float(cfg.get("rarity_factor", 0.5)),
+            )
+            out[name] = [r.model_dump() for r in results]
+        return out
+
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, _run_batch)
+        return JSONResponse({"status": "ok", "results": results})
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
 
 @app.get("/admin", response_class=HTMLResponse)
