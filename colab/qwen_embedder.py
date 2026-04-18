@@ -4,9 +4,10 @@ Pourquoi : Qwen3-Embedding n'expose pas de sparse ni de colbert ; on remplit
 les champs correspondants avec des listes vides pour garder la même signature
 que `BGEM3Wrapper.encode` et limiter l'impact sur le reste du pipeline.
 """
+
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 
 from colab.embedder_v2 import EncodeResult
 
@@ -21,11 +22,13 @@ class QwenEmbedderWrapper:
     tests unitaires qui injectent un `model` factice via le constructeur.
     """
 
-    def __init__(self, model=None, model_name: str = DEFAULT_MODEL_NAME):
+    def __init__(
+        self, model: Any | None = None, model_name: str = DEFAULT_MODEL_NAME
+    ) -> None:
         self._model = model
         self._model_name = model_name
 
-    def _model_or_build(self):
+    def _model_or_build(self) -> Any:
         if self._model is None:
             self._model = _build_model(self._model_name)
         return self._model
@@ -50,10 +53,12 @@ class QwenEmbedderWrapper:
         return EncodeResult(dense=dense, sparse=[], colbert=[], lexical_weights=[])
 
 
-def _build_model(model_name: str):
+def _build_model(model_name: str) -> Any:
     import torch
     from sentence_transformers import SentenceTransformer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    return SentenceTransformer(model_name, device=device, model_kwargs={"torch_dtype": dtype})
+    return SentenceTransformer(
+        model_name, device=device, model_kwargs={"torch_dtype": dtype}
+    )

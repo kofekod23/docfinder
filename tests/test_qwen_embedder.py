@@ -1,15 +1,15 @@
 """Tests unitaires du wrapper Qwen3-Embedding (modèle factice)."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
 from colab.qwen_embedder import QwenEmbedderWrapper
 
 
-def _fake_model(dim: int = 8):
+def _fake_model(dim: int = 8) -> MagicMock:
     model = MagicMock()
 
     def encode(texts, batch_size=32, max_length=512, **_):
@@ -19,7 +19,7 @@ def _fake_model(dim: int = 8):
     return model
 
 
-def test_encode_returns_dense_only():
+def test_encode_returns_dense_only() -> None:
     wrapper = QwenEmbedderWrapper(model=_fake_model(dim=4))
     result = wrapper.encode(["bonjour", "monde"])
     assert len(result.dense) == 2
@@ -29,7 +29,7 @@ def test_encode_returns_dense_only():
     assert result.lexical_weights == []
 
 
-def test_encode_empty_input():
+def test_encode_empty_input() -> None:
     wrapper = QwenEmbedderWrapper(model=_fake_model(dim=4))
     result = wrapper.encode([])
     assert result.dense == []
@@ -37,7 +37,7 @@ def test_encode_empty_input():
     assert result.colbert == []
 
 
-def test_encode_passes_batch_size():
+def test_encode_passes_batch_size() -> None:
     model = _fake_model(dim=4)
     wrapper = QwenEmbedderWrapper(model=model)
     wrapper.encode(["a", "b", "c"], batch_size=16, max_length=256)
