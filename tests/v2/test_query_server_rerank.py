@@ -5,12 +5,24 @@ from fastapi.testclient import TestClient
 import colab.query_server as qs
 
 
-def _client(monkeypatch):
+class _StubRe:
+    def rerank(self, pairs):
+        return [float(i) for i in range(len(pairs))]
+
+
+class _StubWrapper:
+    _model = object()
+
+
+def _prep_env(monkeypatch):
     monkeypatch.setenv("COLAB_QUERY_TOKEN", "secret")
-    class StubRe:
-        def rerank(self, pairs):
-            return [float(i) for i in range(len(pairs))]
-    qs._reranker = StubRe()
+    monkeypatch.setenv("LOAD_RERANKER", "0")
+    monkeypatch.setattr(qs, "_wrapper", _StubWrapper(), raising=False)
+
+
+def _client(monkeypatch):
+    _prep_env(monkeypatch)
+    monkeypatch.setattr(qs, "_reranker", _StubRe(), raising=False)
     return TestClient(qs.app)
 
 
@@ -32,8 +44,8 @@ def test_rerank_requires_token(monkeypatch):
 
 
 def test_rerank_503_when_model_not_loaded(monkeypatch):
-    monkeypatch.setenv("COLAB_QUERY_TOKEN", "secret")
-    qs._reranker = None
+    _prep_env(monkeypatch)
+    monkeypatch.setattr(qs, "_reranker", None, raising=False)
     c = TestClient(qs.app)
     resp = c.post(
         "/rerank",
