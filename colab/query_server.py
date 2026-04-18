@@ -19,6 +19,7 @@ Lancement (dans le notebook Colab) :
   from colab.query_server import app
   uvicorn.run(app, host="0.0.0.0", port=8001)
 """
+
 from __future__ import annotations
 
 import logging
@@ -29,10 +30,13 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from colab.embedder_v2 import BGEM3Wrapper, EncodeResult
+from colab.qwen_embedder import QwenEmbedderWrapper
 from colab.reranker import BGERerankerWrapper
 
 logger = logging.getLogger("docfinder.query_server")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
 
 
 class EncodeRequest(BaseModel):
@@ -59,6 +63,7 @@ class RerankResponse(BaseModel):
 app = FastAPI(title="DocFinder Query Encoder", version="1.0.0")
 _wrapper: BGEM3Wrapper | None = None
 _reranker: BGERerankerWrapper | None = None
+_qwen_wrapper: QwenEmbedderWrapper | None = None
 
 
 def _expected_token() -> str:
@@ -73,7 +78,9 @@ def _expected_token() -> str:
 def _check_auth(received: str | None) -> None:
     expected = _expected_token()
     if not received or received.strip() != expected:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token"
+        )
 
 
 def set_wrapper(wrapper: BGEM3Wrapper) -> None:
@@ -96,6 +103,17 @@ def set_reranker(reranker: BGERerankerWrapper) -> None:
     global _reranker
     _reranker = reranker
     logger.info("BGE-reranker wrapper injected.")
+
+
+def set_qwen_wrapper(wrapper: QwenEmbedderWrapper) -> None:
+    """Inject a pre-built Qwen wrapper (avoids double-load in Colab).
+
+    Miroir de `set_wrapper` pour Qwen3-Embedding. Doit être appelé AVANT
+    `uvicorn.run(app, ...)`.
+    """
+    global _qwen_wrapper
+    _qwen_wrapper = wrapper
+    logger.info("Qwen3-Embedding wrapper injected.")
 
 
 @app.on_event("startup")
@@ -122,21 +140,32 @@ def healthz() -> dict:
 
 
 @app.post("/encode", response_model=EncodeResponse)
-def encode(req: EncodeRequest, x_auth_token: str | None = Header(default=None)) -> EncodeResponse:
+def encode(
+    req: EncodeRequest, x_auth_token: str | None = Header(default=None)
+) -> EncodeResponse:
     _check_auth(x_auth_token)
     if _wrapper is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="model not loaded")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="model not loaded"
+        )
 
     result: EncodeResult = _wrapper.encode(
-        req.queries, batch_size=req.batch_size, max_length=req.max_length,
+        req.queries,
+        batch_size=req.batch_size,
+        max_length=req.max_length,
     )
-    sparse_payload = [[list(map(float, idx)), list(map(float, val))] for idx, val in result.sparse]
-    return EncodeResponse(dense=result.dense, sparse=sparse_payload, colbert=result.colbert)
+    sparse_payload = [
+        [list(map(float, idx)), list(map(float, val))] for idx, val in result.sparse
+    ]
+    return EncodeResponse(
+        dense=result.dense, sparse=sparse_payload, colbert=result.colbert
+    )
 
 
 @app.post("/rerank", response_model=RerankResponse)
 def rerank(
-    req: RerankRequest, x_auth_token: str | None = Header(default=None),
+    req: RerankRequest,
+    x_auth_token: str | None = Header(default=None),
 ) -> RerankResponse:
     _check_auth(x_auth_token)
     if _reranker is None:
@@ -147,3 +176,26 @@ def rerank(
     pairs = [(req.query, doc) for doc in req.documents]
     scores = _reranker.rerank(pairs)
     return RerankResponse(scores=scores)
+
+
+# --- Qwen3-Embedding support (dense-only) --------------------------------
+
+
+@app.post("/encode_qwen", response_model=EncodeResponse)
+def encode_qwen(
+    req: EncodeRequest,
+    x_auth_token: str | None = Header(default=None),
+) -> EncodeResponse:
+    _check_auth(x_auth_token)
+    if _qwen_wrapper is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="qwen model not loaded",
+        )
+    result: EncodeResult = _qwen_wrapper.encode(
+        req.queries,
+        batch_size=req.batch_size,
+        max_length=req.max_length,
+    )
+    # Qwen retourne dense uniquement — sparse/colbert vides
+    return EncodeResponse(dense=result.dense, sparse=[], colbert=[])
