@@ -88,6 +88,11 @@ def set_wrapper(wrapper: BGEM3Wrapper) -> None:
 
 
 def set_reranker(reranker: BGERerankerWrapper) -> None:
+    """Inject a pre-built reranker to avoid loading bge-reranker-v2-m3 twice.
+
+    Miroir de `set_wrapper` pour le cross-encoder. Doit être appelé AVANT
+    `uvicorn.run(app, ...)` si l'indexer partage déjà l'instance GPU.
+    """
     global _reranker
     _reranker = reranker
     logger.info("BGE-reranker wrapper injected.")

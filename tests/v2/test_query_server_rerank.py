@@ -1,5 +1,4 @@
 # tests/v2/test_query_server_rerank.py
-import os
 from fastapi.testclient import TestClient
 
 import colab.query_server as qs
