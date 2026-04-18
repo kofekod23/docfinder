@@ -62,6 +62,18 @@ COLAB_ACTIVE_TIMEOUT = 30.0   # secondes sans upsert = inactif (entre deux batch
 _current_job_excluded: list[str] = []
 
 
+def _resolve_search_config() -> dict[str, str]:
+    """Lit DOCFINDER_COLLECTION + DOCFINDER_EMBEDDER avec fallbacks sûrs.
+
+    Defaults : collection=docfinder_v2, embedder=bgem3 (statu quo BGE-M3).
+    """
+    collection = os.environ.get("DOCFINDER_COLLECTION", "docfinder_v2").strip()
+    embedder = os.environ.get("DOCFINDER_EMBEDDER", "bgem3").strip().lower()
+    if embedder not in {"bgem3", "qwen"}:
+        raise RuntimeError(f"DOCFINDER_EMBEDDER invalide : {embedder!r}")
+    return {"collection": collection, "embedder": embedder}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -162,13 +174,18 @@ async def search(request: Request):
     try:
         loop = asyncio.get_event_loop()
         if os.environ.get("USE_V2", "false").lower() in ("true", "1", "yes", "on"):
+            cfg = _resolve_search_config()
+            encoder = _engine.embedder_v2
+            if cfg["embedder"] == "qwen":
+                from server.encode_client import RemoteEncoder
+                encoder = RemoteEncoder(embedder="qwen")
             results = await loop.run_in_executor(
                 None,
                 lambda: search_v2(
                     _engine.qdrant,
-                    _engine.embedder_v2,
+                    encoder,
                     body.query,
-                    collection="docfinder_v2",
+                    collection=cfg["collection"],
                     limit=body.limit,
                     reranker=_reranker,
                     rerank_top_n=_rerank_top_n,
