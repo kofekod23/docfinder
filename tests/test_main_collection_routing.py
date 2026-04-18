@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
+from server.main import _resolve_search_config
+
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
@@ -17,7 +19,6 @@ def _env(monkeypatch):
 
 
 def test_resolve_collection_prefers_env():
-    from server.main import _resolve_search_config
     cfg = _resolve_search_config()
     assert cfg["collection"] == "docfinder_v2_qwen"
     assert cfg["embedder"] == "qwen"
@@ -26,7 +27,18 @@ def test_resolve_collection_prefers_env():
 def test_resolve_collection_fallback_default(monkeypatch):
     monkeypatch.delenv("DOCFINDER_COLLECTION", raising=False)
     monkeypatch.delenv("DOCFINDER_EMBEDDER", raising=False)
-    from server.main import _resolve_search_config
     cfg = _resolve_search_config()
     assert cfg["collection"] == "docfinder_v2"
     assert cfg["embedder"] == "bgem3"
+
+
+def test_resolve_collection_rejects_empty_collection(monkeypatch):
+    monkeypatch.setenv("DOCFINDER_COLLECTION", "   ")
+    with pytest.raises(ValueError, match="vide"):
+        _resolve_search_config()
+
+
+def test_resolve_collection_rejects_invalid_embedder(monkeypatch):
+    monkeypatch.setenv("DOCFINDER_EMBEDDER", "invalid_name")
+    with pytest.raises(ValueError, match="invalide"):
+        _resolve_search_config()

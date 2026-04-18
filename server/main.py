@@ -17,7 +17,7 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List
+from typing import List, Literal, TypedDict
 from urllib.parse import unquote
 
 import httpx
@@ -27,6 +27,7 @@ from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
+from server.encode_client import RemoteEncoder
 from server.indexer import COLLECTION, ICLOUD_DEFAULT, QDRANT_URL, cancel_indexation, colab_file_skipped, current_job, resume_if_needed, start_indexation, upsert_points
 from server.chunks import iter_chunks_json
 from server.files_api import router as files_router
@@ -34,6 +35,11 @@ from server.admin_v2 import router as admin_v2_router, set_qdrant_client
 from server.search import SearchEngine, search_v2, search_v2_tunable, retrieve_v2_channels, fuse_v2
 from scripts.setup_qdrant_v2 import ensure_collection
 from shared.schema import SearchResult, SearchQuery
+
+
+class _SearchConfig(TypedDict):
+    collection: str
+    embedder: Literal["bgem3", "qwen"]
 
 # Répertoire des templates Jinja2
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -62,15 +68,17 @@ COLAB_ACTIVE_TIMEOUT = 30.0   # secondes sans upsert = inactif (entre deux batch
 _current_job_excluded: list[str] = []
 
 
-def _resolve_search_config() -> dict[str, str]:
+def _resolve_search_config() -> _SearchConfig:
     """Lit DOCFINDER_COLLECTION + DOCFINDER_EMBEDDER avec fallbacks sûrs.
 
     Defaults : collection=docfinder_v2, embedder=bgem3 (statu quo BGE-M3).
     """
     collection = os.environ.get("DOCFINDER_COLLECTION", "docfinder_v2").strip()
+    if not collection:
+        raise ValueError("DOCFINDER_COLLECTION ne peut pas être vide")
     embedder = os.environ.get("DOCFINDER_EMBEDDER", "bgem3").strip().lower()
     if embedder not in {"bgem3", "qwen"}:
-        raise RuntimeError(f"DOCFINDER_EMBEDDER invalide : {embedder!r}")
+        raise ValueError(f"DOCFINDER_EMBEDDER invalide : {embedder!r}")
     return {"collection": collection, "embedder": embedder}
 
 
@@ -177,7 +185,6 @@ async def search(request: Request):
             cfg = _resolve_search_config()
             encoder = _engine.embedder_v2
             if cfg["embedder"] == "qwen":
-                from server.encode_client import RemoteEncoder
                 encoder = RemoteEncoder(embedder="qwen")
             results = await loop.run_in_executor(
                 None,
