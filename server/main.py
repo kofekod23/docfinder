@@ -42,7 +42,10 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 _engine: SearchEngine | None = None
 
 # Instance globale du reranker (initialisée dans lifespan si RERANK_ENABLED)
-_reranker = None
+_reranker: "RemoteReranker | None" = None
+
+# Top-N pour reranking, parsé une fois au démarrage
+_rerank_top_n: int = int(os.environ.get("RERANK_TOP_N", "20"))
 
 # État Colab — mis à jour par heartbeat et upserts
 _colab_state: dict = {
@@ -168,7 +171,7 @@ async def search(request: Request):
                     collection="docfinder_v2",
                     limit=body.limit,
                     reranker=_reranker,
-                    rerank_top_n=int(os.environ.get("RERANK_TOP_N", "20")),
+                    rerank_top_n=_rerank_top_n,
                 ),
             )
         else:
