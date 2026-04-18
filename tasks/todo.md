@@ -64,6 +64,27 @@ Procédure détaillée : `tasks/setup-phase-a-query-tunnel.md`.
 - [ ] Endpoint DELETE /document/{doc_id} pour supprimer de l'index
 - [ ] Support .odt et .rtf
 
+## Suite grid-search (2026-04-18) — leviers matériels, à prioriser
+
+Le grid 41 × 145 plafonne à MRR 0.7513 (+0.0063 vs baseline = bruit). Les 19 requêtes ratées
+ne seront pas sauvées par du tuning de poids. Pistes ROI, par ordre d'impact attendu :
+
+- [x] **Reranker cross-encoder** — bge-reranker-v2-m3 sur top-N → réordonne head.
+      Plan 1 implémenté (branch `claude/review-project-cloudflare-ggcYD`, 12 commits).
+      Feature flag `RERANK_ENABLED=false` par défaut. Mesures A/B (145 queries) en attente
+      d'un tunnel Colab vivant côté utilisateur.
+- [ ] **Re-OCR agressif des scans** — détecter docs avec < N chars extraits et les passer
+      par tesseract ou docTR avant indexation. Règle les cas urssaf/roy/omp où le contenu
+      textuel est quasi vide.
+- [ ] **Dictionnaire d'expansion perso** — table d'alias manuelle (Roy→chien, Yakarouler→employeur,
+      CPAM→sécurité sociale…). Appliqué côté /search avant encoding. Seul moyen de rattraper
+      les requêtes dont la sémantique nécessite un contexte biographique.
+- [ ] **Supprimer `rarity_factor` / `rarity_threshold`** de `server/search.py`
+      (lignes 406-407, 439-445, 481-482, 494). Prouvé no-op sur 7 variantes du grid → MRR
+      identiques à 4 décimales. Ne pas faire pendant une indexation active (restart uvicorn requis).
+- [ ] **Grid ciblé sur les 19 misses uniquement** après chaque nouveau levier implémenté
+      pour mesurer l'impact sans bruit du reste du corpus.
+
 ## À faire — Ré-indexation des fichiers modifiés
 
 Problème : le `doc_id = md5(chemin)` ne tient pas compte du contenu ni de la date de modification.
