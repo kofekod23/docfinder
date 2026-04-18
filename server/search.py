@@ -352,84 +352,97 @@ class SearchEngine:
         return results
 
 
-def search_v2(qdrant, embedder, query: str,
-              collection: str = "docfinder_v2",
-              limit: int = 10,
-              prefetch_limit: int = 300) -> list[SearchResult]:
-    """Fusion RRF au niveau **document** (pas chunk).
+def retrieve_v2_channels(
+    qdrant, embedder, query: str,
+    *,
+    collection: str = "docfinder_v2",
+    prefetch_limit: int = 300,
+) -> dict:
+    """Encode la requête v2 et récupère les 3 canaux Qdrant une seule fois.
 
-    Chaque canal (dense/sparse/colbert) est interrogé séparément; on
-    dédoublonne par doc_id en gardant le meilleur chunk du doc, PUIS on
-    fusionne par RRF. Sans ce garde-fou, un gros document multi-chunks
-    domine: il a N chances d'apparaître en tête dans chaque canal face
-    à un document 1-chunk pertinent qui ne peut apparaître qu'une fois.
-
-    Qdrant `FusionQuery(RRF)` natif fusionne au niveau chunk — un doc
-    de 20 chunks accumule 20 entrées alors qu'un doc de 1 chunk en a 1,
-    d'où disparition des petits documents pertinents du top-N.
+    Retourne un dict sérialisable :
+        {
+            "dense":   [(doc_id, rank, payload), ...],
+            "sparse":  [...],
+            "colbert": [...],
+        }
+    Utilisable en cache pour appliquer plusieurs fusions sur la même requête.
     """
     enc = embedder.encode([query])
     dense_q = enc.dense[0]
     sparse_q = qm.SparseVector(indices=enc.sparse[0][0], values=enc.sparse[0][1])
     colbert_q = enc.colbert[0]
 
-    def _rank_docs(q, using: str) -> list[tuple[str, int, object]]:
-        """Retourne [(doc_id, rank_0based, point)] dédoublonné: 1 chunk/doc."""
+    def _rank_docs(q, using: str) -> list[tuple[str, int, dict]]:
         resp = qdrant.query_points(
             collection_name=collection, query=q, using=using,
             limit=prefetch_limit, with_payload=True,
         )
-        seen: dict[str, tuple[int, object]] = {}
+        seen: dict[str, tuple[int, dict]] = {}
         for rank, pt in enumerate(resp.points):
             pl = pt.payload or {}
             doc_id = pl.get("doc_id") or str(pt.id)
             if doc_id not in seen:
-                seen[doc_id] = (rank, pt)
+                seen[doc_id] = (rank, {"id": str(pt.id), "payload": pl})
         return [(d, r, p) for d, (r, p) in seen.items()]
 
+    return {
+        "dense": _rank_docs(dense_q, "dense"),
+        "sparse": _rank_docs(sparse_q, "sparse"),
+        "colbert": _rank_docs(colbert_q, "colbert"),
+    }
+
+
+def fuse_v2(
+    channels_by_name: dict,
+    query: str,
+    *,
+    limit: int = 10,
+    w_dense: float = 1.0,
+    w_sparse: float = 1.0,
+    w_colbert: float = 1.0,
+    rrf_k: int = RRF_K,
+    filename_boost: float = 1.0,
+    rarity_threshold: float = 0.30,
+    rarity_factor: float = 0.5,
+) -> list[SearchResult]:
+    """Applique RRF + filename_boost sur des canaux pré-récupérés."""
     channels = (
-        _rank_docs(dense_q, "dense"),
-        _rank_docs(sparse_q, "sparse"),
-        _rank_docs(colbert_q, "colbert"),
+        (w_dense, channels_by_name.get("dense", [])),
+        (w_sparse, channels_by_name.get("sparse", [])),
+        (w_colbert, channels_by_name.get("colbert", [])),
     )
 
     rrf: dict[str, float] = {}
-    best_hit: dict[str, object] = {}
+    best_hit: dict[str, dict] = {}
     best_rank: dict[str, int] = {}
-    for channel in channels:
+    for weight, channel in channels:
+        if weight <= 0:
+            continue
         for doc_id, rank, pt in channel:
-            rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (RRF_K + rank)
+            rrf[doc_id] = rrf.get(doc_id, 0.0) + weight * 1.0 / (rrf_k + rank)
             if doc_id not in best_rank or rank < best_rank[doc_id]:
                 best_rank[doc_id] = rank
                 best_hit[doc_id] = pt
 
-    # Filename/title boost — signal très fiable en recherche documentaire.
-    # Un token de la requête qui apparaît dans le path/title récolte 1/RRF_K,
-    # soit l'équivalent d'un rang #1 dans un canal virtuel "filename".
-    #
-    # Règles d'admission des tokens :
-    #   - len >= 4 et pas dans STOPWORDS (filtre "documents", "liste", etc.)
-    #   - OU len 2-3 si le token était UPPERCASE dans la requête d'origine
-    #     (heuristique pour acronymes : PV, SEO, CV, RH)
-    #
-    # Pondération par rareté : si un token apparaît dans > RARITY_THRESHOLD
-    # du pool (best_hit), son poids est divisé par 2 — il discrimine mal.
-    RARITY_THRESHOLD = 0.30
     q_tokens = _extract_boost_tokens(query)
-    if q_tokens and best_hit:
+    if q_tokens and best_hit and filename_boost > 0:
         pool_size = len(best_hit)
         pool_haystacks = {
             doc_id: _normalize_text(
-                f"{(getattr(pt, 'payload', None) or {}).get('path', '')} "
-                f"{(getattr(pt, 'payload', None) or {}).get('title', '')}"
+                f"{pt['payload'].get('path', '')} {pt['payload'].get('title', '')}"
             )
             for doc_id, pt in best_hit.items()
         }
         token_weights: dict[str, float] = {}
         for t in q_tokens:
             df = sum(1 for h in pool_haystacks.values() if t in h)
-            base = 1.0 / RRF_K
-            token_weights[t] = base * 0.5 if df / pool_size > RARITY_THRESHOLD else base
+            base = filename_boost / rrf_k
+            token_weights[t] = (
+                base * rarity_factor
+                if df / pool_size > rarity_threshold
+                else base
+            )
         for doc_id, haystack in pool_haystacks.items():
             boost = sum(w for t, w in token_weights.items() if t in haystack)
             if boost:
@@ -439,9 +452,9 @@ def search_v2(qdrant, embedder, query: str,
     out: list[SearchResult] = []
     for doc_id, score in top:
         pt = best_hit[doc_id]
-        pl = getattr(pt, "payload", None) or {}
+        pl = pt["payload"]
         out.append(SearchResult(
-            chunk_id=str(pt.id),
+            chunk_id=pt["id"],
             doc_id=doc_id,
             title=pl.get("title", ""),
             path=pl.get("path", ""),
@@ -452,3 +465,78 @@ def search_v2(qdrant, embedder, query: str,
             keywords=pl.get("keywords_doc", []),
         ))
     return out
+
+
+def rerank_results(
+    query: str,
+    results: list[SearchResult],
+    reranker,
+    *,
+    top_n: int = 20,
+) -> list[SearchResult]:
+    """Ré-ordonne les `top_n` premiers résultats via un cross-encoder.
+
+    Les résultats au-delà de `top_n` sont conservés dans leur ordre d'origine.
+    Si `reranker` est None, retourne la liste inchangée.
+    """
+    if reranker is None or not results:
+        return results
+    head = results[:top_n]
+    tail = results[top_n:]
+    excerpts = [r.excerpt or r.title or r.path for r in head]
+    scores = reranker.rerank(query, excerpts)
+    order = sorted(range(len(head)), key=lambda i: -scores[i])
+    reordered = []
+    for new_rank, i in enumerate(order):
+        r = head[i]
+        reordered.append(r.model_copy(update={"score": round(float(scores[i]), 4)}))
+    return reordered + tail
+
+
+def search_v2_tunable(
+    qdrant, embedder, query: str,
+    *,
+    collection: str = "docfinder_v2",
+    limit: int = 10,
+    prefetch_limit: int = 300,
+    w_dense: float = 1.0,
+    w_sparse: float = 1.0,
+    w_colbert: float = 1.0,
+    rrf_k: int = RRF_K,
+    filename_boost: float = 1.0,
+    rarity_threshold: float = 0.30,
+    rarity_factor: float = 0.5,
+    reranker=None,
+    rerank_top_n: int = 20,
+) -> list[SearchResult]:
+    """Version paramétrable de search_v2 (retrieval + fusion en un appel)."""
+    channels = retrieve_v2_channels(
+        qdrant, embedder, query,
+        collection=collection, prefetch_limit=prefetch_limit,
+    )
+    fused = fuse_v2(
+        channels, query,
+        limit=max(limit, rerank_top_n),  # récupérer assez pour reranker
+        w_dense=w_dense, w_sparse=w_sparse, w_colbert=w_colbert,
+        rrf_k=rrf_k, filename_boost=filename_boost,
+        rarity_threshold=rarity_threshold, rarity_factor=rarity_factor,
+    )
+    reranked = rerank_results(query, fused, reranker, top_n=rerank_top_n)
+    return reranked[:limit]
+
+
+def search_v2(qdrant, embedder, query: str,
+              collection: str = "docfinder_v2",
+              limit: int = 10,
+              prefetch_limit: int = 300,
+              reranker=None,
+              rerank_top_n: int = 20) -> list[SearchResult]:
+    """Wrapper rétrocompatible de `search_v2_tunable` avec les poids par défaut."""
+    return search_v2_tunable(
+        qdrant, embedder, query,
+        collection=collection,
+        limit=limit,
+        prefetch_limit=prefetch_limit,
+        reranker=reranker,
+        rerank_top_n=rerank_top_n,
+    )
