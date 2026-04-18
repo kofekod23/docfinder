@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import sys
 from pathlib import Path
 
 import httpx
 
 from tasks.queries_semantic import QUERIES
+
+TOP_K = 10
 
 
 def _hit_rank(results: list[dict], path_substring: str) -> int:
@@ -31,16 +31,28 @@ def _hit_rank(results: list[dict], path_substring: str) -> int:
 
 
 def run(mode: str, out_path: Path, base_url: str) -> None:
+    """Run A/B test on queries and write results to CSV.
+
+    Args:
+        mode: "on" or "off" to label the test variant.
+        out_path: Path to write CSV output.
+        base_url: Base URL of the search API.
+    """
     rows = []
     with httpx.Client(timeout=60.0) as c:
         for q_tuple in QUERIES:
             query_text, path_substring = q_tuple
-            resp = c.post(
-                f"{base_url}/search",
-                json={"query": query_text, "limit": 10},
-                headers={"Content-Type": "application/json"},
-            )
-            results = resp.json().get("results", [])
+            try:
+                resp = c.post(
+                    f"{base_url}/search",
+                    json={"query": query_text, "limit": TOP_K},
+                    headers={"Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+            except (httpx.HTTPError, ValueError) as exc:
+                print(f"[warn] query failed: {query_text!r} — {exc}")
+                results = []
             rank = _hit_rank(results, path_substring)
             rows.append({"query": query_text, "rank": rank, "mode": mode})
     with out_path.open("w", newline="", encoding="utf-8") as fh:
@@ -52,8 +64,21 @@ def run(mode: str, out_path: Path, base_url: str) -> None:
 
 
 def compare(off_csv: Path, on_csv: Path) -> None:
-    off = {r["query"]: int(r["rank"]) for r in csv.DictReader(off_csv.open())}
-    on = {r["query"]: int(r["rank"]) for r in csv.DictReader(on_csv.open())}
+    """Compare A/B test results from two CSV files and report MRR and deltas.
+
+    Args:
+        off_csv: Path to CSV with reranker disabled.
+        on_csv: Path to CSV with reranker enabled.
+
+    Raises:
+        ValueError: If either CSV is empty.
+    """
+    with off_csv.open(encoding="utf-8", newline="") as f:
+        off = {r["query"]: int(r["rank"]) for r in csv.DictReader(f)}
+    with on_csv.open(encoding="utf-8", newline="") as f:
+        on = {r["query"]: int(r["rank"]) for r in csv.DictReader(f)}
+    if not off or not on:
+        raise ValueError("CSVs must be non-empty")
     wins, losses, same = 0, 0, 0
     for q in off:
         a, b = off[q], on.get(q, 0)
