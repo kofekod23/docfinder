@@ -15,32 +15,34 @@ def _env(monkeypatch):
 
 
 def test_default_embedder_hits_encode():
-    captured: dict = {}
+    captured: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
         return httpx.Response(200, json={"dense": [[0.1]], "sparse": [], "colbert": []})
 
     transport = httpx.MockTransport(handler)
-    enc = RemoteEncoder(embedder="bgem3")
-    enc._client = httpx.Client(transport=transport)
-    enc._url = "https://colab.example/encode"
+    enc = RemoteEncoder(
+        embedder="bgem3",
+        _client=httpx.Client(transport=transport),
+    )
 
     enc.encode(["hi"])
     assert captured["url"].endswith("/encode")
 
 
 def test_qwen_embedder_hits_encode_qwen():
-    captured: dict = {}
+    captured: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
         return httpx.Response(200, json={"dense": [[0.1]], "sparse": [], "colbert": []})
 
     transport = httpx.MockTransport(handler)
-    enc = RemoteEncoder(embedder="qwen")
-    enc._client = httpx.Client(transport=transport)
-    enc._url = "https://colab.example/encode_qwen"
+    enc = RemoteEncoder(
+        embedder="qwen",
+        _client=httpx.Client(transport=transport),
+    )
 
     enc.encode(["hi"])
     assert captured["url"].endswith("/encode_qwen")

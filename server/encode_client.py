@@ -39,7 +39,18 @@ class RemoteEncoder:
         token: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         embedder: str = "bgem3",
+        *,
+        _client: httpx.Client | None = None,
     ) -> None:
+        """Initialise le client d'encodage distant.
+
+        Args:
+            base_url: URL de base du serveur Colab (env: COLAB_ENCODE_URL si None)
+            token: Token d'authentification (env: COLAB_QUERY_TOKEN si None)
+            timeout: Délai d'expiration en secondes pour les requêtes
+            embedder: Type d'encodeur ("bgem3" ou "qwen")
+            _client: [Injection de dépendance pour tests] Client httpx injecté
+        """
         url = (base_url or os.environ.get("COLAB_ENCODE_URL", "")).strip().rstrip("/")
         auth = (token or os.environ.get("COLAB_QUERY_TOKEN", "")).strip()
         if not url:
@@ -58,7 +69,7 @@ class RemoteEncoder:
             self._headers["CF-Access-Client-Id"] = cf_id
             self._headers["CF-Access-Client-Secret"] = cf_secret
 
-        self._client = httpx.Client(timeout=timeout)
+        self._client = _client if _client is not None else httpx.Client(timeout=timeout)
         logger.info("RemoteEncoder targeting %s", self._url)
 
     def encode(
