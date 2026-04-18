@@ -29,6 +29,7 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from colab.embedder_v2 import BGEM3Wrapper, EncodeResult
+from colab.reranker import BGERerankerWrapper
 
 logger = logging.getLogger("docfinder.query_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -46,8 +47,18 @@ class EncodeResponse(BaseModel):
     colbert: List[List[List[float]]]
 
 
+class RerankRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    documents: List[str] = Field(..., min_length=1, max_length=200)
+
+
+class RerankResponse(BaseModel):
+    scores: List[float]
+
+
 app = FastAPI(title="DocFinder Query Encoder", version="1.0.0")
 _wrapper: BGEM3Wrapper | None = None
+_reranker: BGERerankerWrapper | None = None
 
 
 def _expected_token() -> str:
@@ -76,16 +87,27 @@ def set_wrapper(wrapper: BGEM3Wrapper) -> None:
     logger.info("BGE-M3 wrapper injected (shared with indexer).")
 
 
+def set_reranker(reranker: BGERerankerWrapper) -> None:
+    global _reranker
+    _reranker = reranker
+    logger.info("BGE-reranker wrapper injected.")
+
+
 @app.on_event("startup")
 def _load_model() -> None:
-    global _wrapper
-    if _wrapper is not None:
+    global _wrapper, _reranker
+    if _wrapper is None:
+        logger.info("Loading BGE-M3 model on GPU (fp16)…")
+        _wrapper = BGEM3Wrapper()
+        _wrapper._model_or_build()
+        logger.info("BGE-M3 model ready.")
+    else:
         logger.info("BGE-M3 wrapper already present, skipping reload.")
-        return
-    logger.info("Loading BGE-M3 model on GPU (fp16)…")
-    _wrapper = BGEM3Wrapper()
-    _wrapper._model_or_build()
-    logger.info("BGE-M3 model ready.")
+    if _reranker is None and os.environ.get("LOAD_RERANKER", "1") == "1":
+        logger.info("Loading BGE-reranker-v2-m3 on GPU (fp16)…")
+        _reranker = BGERerankerWrapper()
+        _reranker._load()
+        logger.info("BGE-reranker ready.")
 
 
 @app.get("/healthz")
@@ -105,3 +127,18 @@ def encode(req: EncodeRequest, x_auth_token: str | None = Header(default=None)) 
     )
     sparse_payload = [[list(map(float, idx)), list(map(float, val))] for idx, val in result.sparse]
     return EncodeResponse(dense=result.dense, sparse=sparse_payload, colbert=result.colbert)
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(
+    req: RerankRequest, x_auth_token: str | None = Header(default=None),
+) -> RerankResponse:
+    _check_auth(x_auth_token)
+    if _reranker is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="reranker not loaded",
+        )
+    pairs = [(req.query, doc) for doc in req.documents]
+    scores = _reranker.rerank(pairs)
+    return RerankResponse(scores=scores)
