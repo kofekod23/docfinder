@@ -9,6 +9,7 @@ transport.
 Si l'URL ou le token n'est pas configuré, l'instanciation échoue explicitement :
 on veut un 503 plutôt qu'un fallback silencieux.
 """
+
 from __future__ import annotations
 
 import logging
@@ -22,6 +23,7 @@ from colab.embedder_v2 import EncodeResult
 logger = logging.getLogger("docfinder.encode_client")
 
 DEFAULT_TIMEOUT_S = 30.0
+_ENDPOINTS = {"bgem3": "/encode", "qwen": "/encode_qwen"}
 
 
 class RemoteEncoderError(RuntimeError):
@@ -36,6 +38,7 @@ class RemoteEncoder:
         base_url: str | None = None,
         token: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
+        embedder: str = "bgem3",
     ) -> None:
         url = (base_url or os.environ.get("COLAB_ENCODE_URL", "")).strip().rstrip("/")
         auth = (token or os.environ.get("COLAB_QUERY_TOKEN", "")).strip()
@@ -43,8 +46,10 @@ class RemoteEncoder:
             raise RemoteEncoderError("COLAB_ENCODE_URL is not set")
         if not auth:
             raise RemoteEncoderError("COLAB_QUERY_TOKEN is not set")
+        if embedder not in _ENDPOINTS:
+            raise RemoteEncoderError(f"unknown embedder: {embedder!r}")
 
-        self._url = f"{url}/encode"
+        self._url = f"{url}{_ENDPOINTS[embedder]}"
         self._headers = {"X-Auth-Token": auth, "Content-Type": "application/json"}
 
         cf_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
@@ -57,7 +62,10 @@ class RemoteEncoder:
         logger.info("RemoteEncoder targeting %s", self._url)
 
     def encode(
-        self, texts: List[str], batch_size: int = 32, max_length: int = 512,
+        self,
+        texts: List[str],
+        batch_size: int = 32,
+        max_length: int = 512,
     ) -> EncodeResult:
         if not texts:
             return EncodeResult(dense=[], sparse=[], colbert=[], lexical_weights=[])
@@ -65,7 +73,11 @@ class RemoteEncoder:
             resp = self._client.post(
                 self._url,
                 headers=self._headers,
-                json={"queries": texts, "batch_size": batch_size, "max_length": max_length},
+                json={
+                    "queries": texts,
+                    "batch_size": batch_size,
+                    "max_length": max_length,
+                },
             )
         except httpx.HTTPError as exc:
             raise RemoteEncoderError(f"remote encoder unreachable: {exc}") from exc
