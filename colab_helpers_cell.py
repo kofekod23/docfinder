@@ -100,16 +100,46 @@ def extractor(path, mode):
 # _get_running_loop()). Seule porte de sortie : un thread dédié qui n'a pas
 # de loop courante.
 def _run_pipeline_threaded():
+    """Run pipeline with auto-retry on transient errors (502, connection refused).
+
+    Rationale (cf. tasks/lessons.md L#29 2026-04-19) : quand le Mac uvicorn est
+    momentanément indisponible (jetsam kill + LaunchAgent respawn, throttle 10s,
+    ou restart utilisateur), le pipeline Colab mourait en une exception unique et
+    il fallait rerun la cellule à la main. Le pipeline est désormais self-healing :
+    il boucle avec backoff exponentiel jusqu'à succès ou Stop cellule.
+    """
+    import time
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    attempt = 0
+    backoff = 15  # secondes
+    max_backoff = 300  # 5 minutes entre deux retries
     try:
-        loop.run_until_complete(run_pipeline(
-            MAC_BASE, ROOT,
-            mac_client=mac, extractor=extractor, embedder=embedder,
-            tokenizer_decode=tokenizer_decode,
-            tmp_dir=tmp, checkpoint_path=ck,
-            tokenize_len=tokenize_len_bgem3,
-        ))
+        while True:
+            attempt += 1
+            try:
+                print(f"[colab_helpers_cell] pipeline attempt #{attempt} starting…")
+                loop.run_until_complete(run_pipeline(
+                    MAC_BASE, ROOT,
+                    mac_client=mac, extractor=extractor, embedder=embedder,
+                    tokenizer_decode=tokenizer_decode,
+                    tmp_dir=tmp, checkpoint_path=ck,
+                    tokenize_len=tokenize_len_bgem3,
+                ))
+                print(f"[colab_helpers_cell] pipeline attempt #{attempt} succeeded.")
+                return  # Succès : on sort.
+            except KeyboardInterrupt:
+                print("[colab_helpers_cell] pipeline interrupted by user.")
+                return
+            except Exception as exc:
+                # Transient HTTP / connection errors → retry. Autres erreurs
+                # (bug code, ground-truth corrupted) → aussi retry pour éviter
+                # de laisser le notebook mort quand l'utilisateur est absent.
+                msg = f"{type(exc).__name__}: {exc}"
+                print(f"[colab_helpers_cell] pipeline attempt #{attempt} failed: {msg}")
+                print(f"[colab_helpers_cell] retry dans {backoff}s…")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
     finally:
         loop.close()
 
@@ -118,6 +148,6 @@ _pipeline_thread = threading.Thread(
     target=_run_pipeline_threaded, name="pipeline", daemon=False,
 )
 _pipeline_thread.start()
-print("[colab_helpers_cell] pipeline lancé (thread dédié). Join en cours…")
+print("[colab_helpers_cell] pipeline lancé (thread dédié, auto-retry). Join en cours…")
 _pipeline_thread.join()
 print("[colab_helpers_cell] pipeline terminé.")
