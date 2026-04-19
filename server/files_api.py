@@ -6,6 +6,7 @@ sont exposés à l'indexeur Colab.
 """
 from __future__ import annotations
 
+import asyncio
 import errno
 import os
 import threading
@@ -20,10 +21,11 @@ from shared.hashing import doc_id_for
 
 # Sérialisation des reads disque : macOS + File Provider Extension (Google Drive
 # FS / iCloud) renvoie EDEADLK sur reads concurrents dans le même process uvicorn.
-# Un seul read à la fois élimine le problème ; l'overhead sur un throughput typique
-# (Colab 16 workers parallèles, fichiers ~1 MB) reste négligeable car le lock
-# n'est tenu que pendant la lecture disque (quelques ms).
-_FILE_READ_LOCK = threading.Lock()
+# Sémaphore asyncio (pas threading.Lock) pour sérialiser à travers les coroutines
+# du même event loop ; le sync threadpool avec subprocess.run ne parvenait pas à
+# faire sortir le File Provider de son deadlock état, d'où le passage à
+# asyncio.create_subprocess_exec (diagnostic 2026-04-19).
+_ASYNC_READ_SEM = asyncio.Semaphore(1)
 
 router = APIRouter()
 
@@ -105,8 +107,29 @@ def files_list(root: str = Query(...)) -> List[dict]:
     return out
 
 
+async def _run_cmd(cmd: list[str], timeout: float) -> tuple[int, bytes, bytes]:
+    """Run shell command via asyncio.create_subprocess_exec (event-loop native).
+
+    Contraste avec subprocess.run + threadpool qui hérite d'un état File Provider
+    problématique dans uvicorn. Le subprocess async passe par le kqueue de l'event
+    loop, évite la pollution par les handlers sync.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise HTTPException(504, f"timeout ({timeout}s) for {cmd[0]}")
+    return proc.returncode or 0, stdout, stderr
+
+
 @router.get("/files/raw")
-def files_raw(path: str = Query(...)) -> StreamingResponse:
+async def files_raw(path: str = Query(...)) -> StreamingResponse:
     p = Path(path).expanduser().resolve()
     allowed = _allowed_roots()
     if not any(str(p).startswith(str(a)) for a in allowed):
@@ -114,51 +137,24 @@ def files_raw(path: str = Query(...)) -> StreamingResponse:
     if not p.exists() or not p.is_file():
         raise HTTPException(404, f"file not found: {p}")
 
-    # Lecture via subprocess `cat` pour contourner EDEADLK sur fichiers Google
-    # Drive FS "online only" (le in-process open déclenche un deadlock sous
-    # uvicorn threadpool — diagnostic 2026-04-19). Pré-warm via `head -c 1`
-    # force le File Provider à matérialiser le fichier avant le cat complet ;
-    # sans ce pré-warm, `cat` direct lui-même échoue en EDEADLK. Avec pré-warm,
-    # la probabilité de succès monte à 100% sur les fichiers testés.
-    # Fichiers > 50 MB filtrés côté listing donc RAM safe.
-    import subprocess
-    data: bytes | None = None
-    last_err: str = ""
-    for attempt in range(6):
-        try:
-            with _FILE_READ_LOCK:
-                # Pré-warm matérialisation Google Drive FS (best-effort).
-                subprocess.run(
-                    ["head", "-c", "1", str(p)],
-                    capture_output=True,
-                    timeout=30,
-                )
-                # Lecture complète.
-                result = subprocess.run(
-                    ["cat", str(p)],
-                    capture_output=True,
-                    timeout=120,
-                )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(504, f"read timeout for {p.name}")
-        if result.returncode == 0:
-            data = result.stdout
-            break
-        last_err = result.stderr.decode("utf-8", "replace")[:300]
-        if "deadlock" in last_err.lower() and attempt < 5:
-            time.sleep(1.0 * (2 ** attempt))  # 1, 2, 4, 8, 16s
-            continue
-        # Autre erreur → abandon immédiat
-        raise HTTPException(
-            500,
-            f"cat failed (rc={result.returncode}): {last_err}",
-        )
-    if data is None:
-        # Tous les essais ont échoué sur deadlock → 503 retryable côté Colab.
-        raise HTTPException(
-            503,
-            f"persistent deadlock after 6 retries: {last_err}",
-        )
+    # Lecture via asyncio subprocess. Les fichiers "online only" Google Drive FS
+    # déclenchent EDEADLK dans tout contexte uvicorn (diagnostic 2026-04-19 :
+    # sync/async, subprocess/threadpool, pré-warm — rien ne débloque). Workaround
+    # externe : `find ~/Documents -type f -exec head -c 1 {} \\; > /dev/null`
+    # en bash (hors uvicorn) matérialise les fichiers proprement avant indexation.
+    # Ici on fail-fast en 503 sur deadlock → Colab retry backoff gère.
+    async with _ASYNC_READ_SEM:
+        rc, stdout, stderr = await _run_cmd(["cat", str(p)], timeout=120.0)
+    if rc == 0:
+        data = stdout
+    else:
+        err = stderr.decode("utf-8", "replace")[:300]
+        if "deadlock" in err.lower():
+            raise HTTPException(
+                503,
+                f"deadlock on {p.name} — bash prewarm Mac-side required",
+            )
+        raise HTTPException(500, f"cat failed (rc={rc}): {err}")
 
     def stream():
         yield data
