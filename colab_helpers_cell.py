@@ -55,6 +55,29 @@ tokenize_len_bgem3 = lambda t: len(_xlmr_tokenizer.encode(t, add_special_tokens=
 # Partage du wrapper avec le serveur d'encodage → un seul modèle en VRAM.
 query_server.set_wrapper(embedder)
 
+# Plan 1 (reranker A/B) : charger bge-reranker-v2-m3 si activé (défaut ON).
+# Ajoute /rerank au serveur query_server sans dupliquer le modèle GPU.
+if os.environ.get("DOCFINDER_ENABLE_RERANKER", "1").strip() == "1":
+    from colab.reranker import BGERerankerWrapper
+    reranker = BGERerankerWrapper()
+    reranker._load()
+    query_server.set_reranker(reranker)
+    print("[colab_helpers_cell] reranker bge-reranker-v2-m3 chargé.")
+else:
+    print("[colab_helpers_cell] reranker désactivé (DOCFINDER_ENABLE_RERANKER!=1).")
+
+# Plan 2 (Qwen A/B) : charger Qwen3-Embedding-0.6B si activé (défaut OFF).
+# Ajoute /encode_qwen au serveur query_server pour le run A/B dense-only 1024d.
+if os.environ.get("DOCFINDER_ENABLE_QWEN", "").strip() == "1":
+    from colab.qwen_embedder import QwenEmbedderWrapper
+    qwen = QwenEmbedderWrapper()
+    qwen._model_or_build()
+    query_server.set_qwen_wrapper(qwen)
+    print("[colab_helpers_cell] Qwen3-Embedding-0.6B chargé.")
+else:
+    qwen = None
+    print("[colab_helpers_cell] Qwen désactivé (DOCFINDER_ENABLE_QWEN!=1).")
+
 config = uvicorn.Config(
     query_server.app, host="0.0.0.0", port=8001, log_level="info", access_log=False,
 )
