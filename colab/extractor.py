@@ -66,6 +66,21 @@ def _render_page_rgb(page, dpi: int = 200):
     return img[..., :3] if pix.n >= 3 else img
 
 
+# Seuil de déclenchement de l'OCR côté page.
+# < 10 chars avant 2026-04-19 → trop strict : une page scan avec un en-tête
+# imprimé type "Page 1 / Mairie de Paris" (~25 chars) échappait à l'OCR et
+# ne remontait pas de contenu. 100 chars couvre l'immense majorité des vrais
+# scans sans faux positifs sur les pages légitimement vides (cf. tasks/lessons.md).
+PAGE_OCR_MIN_CHARS = 100
+
+# Filet de sécurité doc-level : après extraction de toutes les pages, si le total
+# de texte reste très faible pour un PDF non-trivial, on force l'OCR sur toutes
+# les pages non encore OCRisées. Règle les cas où chaque page a juste assez de
+# chars (ex. 105 chars de numérotation) pour passer le seuil page mais que le
+# contenu sémantique est dans l'image du scan.
+DOC_OCR_FALLBACK_CHARS = 300
+
+
 def _extract_pdf(path: Path, mode: str) -> ExtractionResult:
     import fitz  # PyMuPDF
     doc = fitz.open(str(path))
@@ -73,40 +88,73 @@ def _extract_pdf(path: Path, mode: str) -> ExtractionResult:
     limit = HEAD_PAGES if mode == "head_only" else total
     parts: list[str] = []
     ocr_pages: list[int] = []
-    ocr_fn = None
-    for i in range(min(limit, total)):
+    ocr_fn_holder: list = [None]  # boîte mutable pour partager entre passes
+
+    def _load_ocr():
+        if ocr_fn_holder[0] is None:
+            try:
+                from colab.ocr import ocr_page as ocr_fn_impl
+                ocr_fn_holder[0] = ocr_fn_impl
+            except Exception as e:
+                print(f"[extractor] OCR unavailable: {type(e).__name__}: {e}",
+                      flush=True)
+                ocr_fn_holder[0] = False
+        return ocr_fn_holder[0]
+
+    def _ocr_page_safe(page_index: int, page) -> str:
+        fn = _load_ocr()
+        if not fn:
+            return ""
+        try:
+            img = _render_page_rgb(page)
+            ocr_txt = fn(img)
+            if ocr_txt.strip():
+                print(f"[extractor] OCR {path.name} p{page_index+1}: "
+                      f"{len(ocr_txt)} chars", flush=True)
+                return ocr_txt
+        except Exception as e:
+            print(f"[extractor] OCR page {page_index} failed on {path.name}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+        return ""
+
+    processed = min(limit, total) if total else 0
+
+    # Passe 1 — extraction texte natif, avec fallback OCR page-level sur seuil.
+    for i in range(processed):
         page = doc.load_page(i)
         txt = page.get_text()
-        if len(txt.strip()) < 10:
+        if len(txt.strip()) < PAGE_OCR_MIN_CHARS:
             ocr_pages.append(i)
-            if ocr_fn is None:
-                try:
-                    from colab.ocr import ocr_page as ocr_fn_impl
-                    ocr_fn = ocr_fn_impl
-                except Exception as e:
-                    print(f"[extractor] OCR unavailable: {type(e).__name__}: {e}",
-                          flush=True)
-                    ocr_fn = False
-            if ocr_fn:
-                try:
-                    img = _render_page_rgb(page)
-                    ocr_txt = ocr_fn(img)
-                    if ocr_txt.strip():
-                        parts.append(ocr_txt)
-                        print(f"[extractor] OCR {path.name} p{i+1}: "
-                              f"{len(ocr_txt)} chars", flush=True)
-                except Exception as e:
-                    print(f"[extractor] OCR page {i} failed on {path.name}: "
-                          f"{type(e).__name__}: {e}", flush=True)
+            ocr_txt = _ocr_page_safe(i, page)
+            if ocr_txt:
+                parts.append(ocr_txt)
             continue
         parts.append(txt)
-    processed = min(limit, total) if total else 0
+
+    # Passe 2 (filet de sécurité) — si le total reste famélique sur un PDF
+    # substantiel, ré-OCR de toutes les pages non encore traitées.
+    already_ocr = set(ocr_pages)
+    total_chars = sum(len(p) for p in parts)
+    if (
+        processed > 0
+        and total_chars < DOC_OCR_FALLBACK_CHARS
+        and len(already_ocr) < processed
+    ):
+        for i in range(processed):
+            if i in already_ocr:
+                continue
+            page = doc.load_page(i)
+            ocr_pages.append(i)
+            ocr_txt = _ocr_page_safe(i, page)
+            if ocr_txt:
+                parts.append(ocr_txt)
+
     is_scan = bool(ocr_pages) and len(ocr_pages) / max(1, processed) >= 0.5
     return ExtractionResult(
         text="\n\n".join(parts),
         doc_type="pdf",
         page_count=total,
-        ocr_pages=tuple(ocr_pages),
+        ocr_pages=tuple(sorted(set(ocr_pages))),
         is_scan=is_scan,
     )
 
