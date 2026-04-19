@@ -42,10 +42,14 @@ class QwenEmbedderWrapper:
         if not texts:
             return EncodeResult(dense=[], sparse=[], colbert=[], lexical_weights=[])
         m = self._model_or_build()
+        # SentenceTransformer.encode() n'accepte pas `max_length` : on pilote la
+        # troncature via l'attribut `max_seq_length` du modèle (applicable à
+        # toutes les entrées du batch).
+        if hasattr(m, "max_seq_length"):
+            m.max_seq_length = max_length
         dense_raw = m.encode(
             texts,
             batch_size=batch_size,
-            max_length=max_length,
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
