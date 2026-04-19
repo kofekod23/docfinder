@@ -140,6 +140,13 @@ async def run_pipeline(
     progress_every: int = 5,
     tokenize_len: Callable[[str], int] | None = None,
 ) -> None:
+    # Override concurrency depuis env si renseigné (utile pour adapter au GPU
+    # Colab : T4 = 8 workers OK, L4 = 16, A100 = 32+).
+    env_workers = os.environ.get("DOCFINDER_HTTP_WORKERS", "").strip()
+    if env_workers.isdigit() and int(env_workers) > 0:
+        http_workers = int(env_workers)
+        print(f"[run_pipeline] DOCFINDER_HTTP_WORKERS={http_workers} (override)", flush=True)
+
     ck = Checkpoint(checkpoint_path)
     ck.load()
 
