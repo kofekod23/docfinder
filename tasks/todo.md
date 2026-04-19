@@ -170,6 +170,15 @@ Après install, le tunnel `docfinder.jinkohub.digital` retourne 200 en permanenc
 Options suite ouvertes :
 (a) merger la branche (Plan 1 code + Plan 2 code, tous deux neutres par défaut via leurs flags respectifs), (b) lancer la mesure A/B live Qwen (Plan 2) quand le notebook Colab Qwen sera réexposé, (c) grid ciblé sur les 19 misses persistantes (re-OCR, dictionnaire d'alias, etc.).
 ## Campagne OCR agressif (2026-04-19 16:45) — code livré, à déployer
+### Statut réveil autonome 2026-04-19 21:53
+
+- Indexation Colab : **253/358 docs (71%), Qdrant points = 1710**
+- Daemon iCloud prewarm : actif (PID 20037)
+- Mac uvicorn + LaunchAgent : OK
+- **BLOCAGE** : tunnel #2 `encode.jinkohub.digital` down (530/1033). Cache encode vide.
+- A/B non lancé. Reschedule autonome pour check ultérieur.
+- Notebook v4 (`colab_docfinder_v4.ipynb`) committé avec watchdog cloudflared intégré pour éviter ce blocage en session future.
+
 
 **Cible** : 13/22 requêtes ratées appartiennent à des scans PDF (attestation-ameli, prévoyance axa, URSSAF x2, solde-de-tout-compte, fiches-paie Yakarouler, télétravail x3, courrier omp stationnement, résiliation parking x2, cle-de-secours, questionnaire lycée). Analyse : `tasks/ab_out/rerank_off.csv` ∩ `tasks/queries_semantic.py`.
 
