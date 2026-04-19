@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import time
@@ -43,6 +44,8 @@ class _SearchConfig(TypedDict):
 
 # Répertoire des templates Jinja2
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+logger = logging.getLogger("docfinder.main")
 
 # Instance globale du moteur (initialisée dans lifespan)
 _engine: SearchEngine | None = None
@@ -215,6 +218,7 @@ async def search(request: Request):
             },
         )
     except Exception as exc:
+        logger.exception("/search failed for query=%r (v2=%s)", body.query, os.environ.get("USE_V2"))
         if is_json:
             return JSONResponse(
                 {"status": "error", "message": str(exc)}, status_code=500
@@ -238,9 +242,7 @@ async def search_tune(request: Request):
             "w_sparse": 1.0,
             "w_colbert": 1.0,
             "rrf_k": 60,
-            "filename_boost": 1.0,
-            "rarity_threshold": 0.30,
-            "rarity_factor": 0.5
+            "filename_boost": 1.0
         }
     """
     try:
@@ -264,8 +266,6 @@ async def search_tune(request: Request):
         w_colbert=float(body.get("w_colbert", 1.0)),
         rrf_k=int(body.get("rrf_k", 60) or 60),
         filename_boost=float(body.get("filename_boost", 1.0)),
-        rarity_threshold=float(body.get("rarity_threshold", 0.30)),
-        rarity_factor=float(body.get("rarity_factor", 0.5)),
     )
 
     try:
@@ -294,8 +294,7 @@ async def search_tune_batch(request: Request):
             "prefetch_limit": 300,
             "configs": [
                 {"name": "...", "w_dense": ..., "w_sparse": ..., "w_colbert": ...,
-                 "rrf_k": ..., "filename_boost": ..., "rarity_threshold": ...,
-                 "rarity_factor": ...},
+                 "rrf_k": ..., "filename_boost": ...},
                 ...
             ]
         }
@@ -338,8 +337,6 @@ async def search_tune_batch(request: Request):
                 w_colbert=float(cfg.get("w_colbert", 1.0)),
                 rrf_k=int(cfg.get("rrf_k", 60) or 60),
                 filename_boost=float(cfg.get("filename_boost", 1.0)),
-                rarity_threshold=float(cfg.get("rarity_threshold", 0.30)),
-                rarity_factor=float(cfg.get("rarity_factor", 0.5)),
             )
             out[name] = [r.model_dump() for r in results]
         return out

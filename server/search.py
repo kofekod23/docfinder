@@ -209,12 +209,25 @@ class SearchEngine:
     """
 
     def __init__(self) -> None:
-        # Récupère le singleton Embedder (chargé au démarrage via lifespan)
-        self.embedder = Embedder.get_instance()
+        import os
         self.client = QdrantClient(url=QDRANT_URL)
         self.qdrant = self.client  # Alias for compatibility with v2 path
-        self._embedder_v2 = None  # Lazy-loaded BGE-M3 embedder for v2 search
+        self._embedder: "Embedder | None" = None  # Lazy-loaded v1 local embedder
+        self._embedder_v2 = None  # Lazy-loaded v2 embedder (remote if COLAB_ENCODE_URL set)
+        # Pré-chargement du singleton local uniquement si aucun encoder distant n'est
+        # configuré. Sur Intel Mac 16 GB, charger `multilingual-e5-large` (~1 GB) alors
+        # qu'on passe de toute façon par Colab pour encoder = jetsam kill sous pression
+        # mémoire (cf. tasks/lessons.md L#28 2026-04-19).
+        if not os.environ.get("COLAB_ENCODE_URL", "").strip():
+            self._embedder = Embedder.get_instance()
         print(f"[SearchEngine] Connecté à Qdrant ({QDRANT_URL}), collection '{COLLECTION_NAME}'.")
+
+    @property
+    def embedder(self) -> "Embedder":
+        """Embedder local — lazy pour ne pas saturer la RAM quand COLAB_ENCODE_URL est set."""
+        if self._embedder is None:
+            self._embedder = Embedder.get_instance()
+        return self._embedder
 
     @property
     def embedder_v2(self):
@@ -403,8 +416,6 @@ def fuse_v2(
     w_colbert: float = 1.0,
     rrf_k: int = RRF_K,
     filename_boost: float = 1.0,
-    rarity_threshold: float = 0.30,
-    rarity_factor: float = 0.5,
 ) -> list[SearchResult]:
     """Applique RRF + filename_boost sur des canaux pré-récupérés."""
     channels = (
@@ -427,24 +438,15 @@ def fuse_v2(
 
     q_tokens = _extract_boost_tokens(query)
     if q_tokens and best_hit and filename_boost > 0:
-        pool_size = len(best_hit)
         pool_haystacks = {
             doc_id: _normalize_text(
                 f"{pt['payload'].get('path', '')} {pt['payload'].get('title', '')}"
             )
             for doc_id, pt in best_hit.items()
         }
-        token_weights: dict[str, float] = {}
-        for t in q_tokens:
-            df = sum(1 for h in pool_haystacks.values() if t in h)
-            base = filename_boost / rrf_k
-            token_weights[t] = (
-                base * rarity_factor
-                if df / pool_size > rarity_threshold
-                else base
-            )
+        token_weight = filename_boost / rrf_k
         for doc_id, haystack in pool_haystacks.items():
-            boost = sum(w for t, w in token_weights.items() if t in haystack)
+            boost = sum(token_weight for t in q_tokens if t in haystack)
             if boost:
                 rrf[doc_id] += boost
 
@@ -509,8 +511,6 @@ def search_v2_tunable(
     w_colbert: float = 1.0,
     rrf_k: int = RRF_K,
     filename_boost: float = 1.0,
-    rarity_threshold: float = 0.30,
-    rarity_factor: float = 0.5,
     reranker=None,
     rerank_top_n: int = 20,
 ) -> list[SearchResult]:
@@ -524,7 +524,6 @@ def search_v2_tunable(
         limit=max(limit, rerank_top_n),  # récupérer assez pour reranker
         w_dense=w_dense, w_sparse=w_sparse, w_colbert=w_colbert,
         rrf_k=rrf_k, filename_boost=filename_boost,
-        rarity_threshold=rarity_threshold, rarity_factor=rarity_factor,
     )
     reranked = rerank_results(query, fused, reranker, top_n=rerank_top_n)
     return reranked[:limit]
